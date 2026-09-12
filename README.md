@@ -122,7 +122,7 @@ sequenceDiagram
     Note over C,P: delivered, receipt stored
     C->>P: 12:00 nudge (+3h, still no reply)
     C->>G: 15:00 "We haven't heard back from Mum today"
-    Note over C,G: one escalation per day; nudging stops
+    Note over C,G: one escalation per day, nudging stops
 ```
 
 ### 2. A concerning reply — immediate escalation
@@ -136,7 +136,7 @@ sequenceDiagram
     C->>P: 09:00 check-in
     P->>C: 09:12 "I fell in the bathroom and I cannot get up"
     Note over C: tripwire matches before any judgement
-    C->>G: "Mum sent a message that needs attention: <quote>"
+    C->>G: "Mum sent a message that needs attention: I fell..."
     Note over C,G: quote is redacted and bounded, never interpreted
 ```
 

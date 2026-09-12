@@ -7,7 +7,7 @@ from care import triage
 from care.clock import Clock, load_zone, local_datetime_for, make_window, to_local
 from care.config import CHECKIN_WINDOW_MINUTES, Config
 from care.delivery import PRIORITY_ESCALATION, PRIORITY_ROUTINE
-from care.models import UpdateEnvelope, checkin_episode_id, make_action_key
+from care.models import UpdateEnvelope, checkin_episode_id, escalation_episode_id, make_action_key
 from care.redaction import redact_and_bound
 from care.store import Store, WriteTxn
 
@@ -273,6 +273,63 @@ def _is_escalation_step(action_key: str) -> bool:
     return step == STEP_ESCALATION or step.startswith("concern:")
 
 
+def _enqueue_concern_escalation(
+    txn: WriteTxn,
+    config: Config,
+    *,
+    episode_id: str,
+    step: str,
+    excerpt: str,
+    now_utc: datetime,
+) -> None:
+    _enqueue(
+        txn,
+        episode_id=episode_id,
+        step=step,
+        chat_id=config.roster.group.chat_id,
+        text=_message(config, "escalation_concern", parent_name=config.roster.parent.name, excerpt=excerpt),
+        priority=PRIORITY_ESCALATION,
+        now_utc=now_utc,
+    )
+
+
+def _escalate_uncorrelated_tripwire(
+    txn: WriteTxn,
+    config: Config,
+    envelope: UpdateEnvelope,
+    now_utc: datetime,
+    local_day: date,
+) -> ReplyOutcome:
+    episode_id = escalation_episode_id(f"concern:{envelope.message_id}")
+    excerpt = redact_and_bound(envelope.text)
+    txn.append_event(
+        ts_utc=now_utc,
+        local_day=local_day,
+        kind=EVENT_REPLY_CLASSIFIED,
+        episode_id=episode_id,
+        actor_id=envelope.sender_id,
+        source_update_id=envelope.update_id,
+        payload={"classification": CLASSIFICATION_CONCERNING, "excerpt": excerpt, "correlated": False},
+    )
+    _enqueue_concern_escalation(
+        txn,
+        config,
+        episode_id=episode_id,
+        step=STEP_ESCALATION,
+        excerpt=excerpt,
+        now_utc=now_utc,
+    )
+    txn.append_event(
+        ts_utc=now_utc,
+        local_day=local_day,
+        kind=EVENT_CONCERN_ESCALATION,
+        episode_id=episode_id,
+        source_update_id=envelope.update_id,
+        payload={"correlated": False},
+    )
+    return ReplyOutcome(kind=REPLY_KIND_PARENT, episode_id=episode_id, classification=CLASSIFICATION_CONCERNING)
+
+
 def _process_parent_reply(
     store: Store,
     txn: WriteTxn,
@@ -281,11 +338,16 @@ def _process_parent_reply(
     now_utc: datetime,
     local_day: date,
 ) -> ReplyOutcome:
+    concerning = _is_concerning(config, envelope.text)
     episode_id = _correlate_checkin_episode(store, envelope)
-    if episode_id is None:
-        return ReplyOutcome(kind=REPLY_KIND_UNRELATED, episode_id=None, classification=None)
 
-    classification = CLASSIFICATION_CONCERNING if _is_concerning(config, envelope.text) else CLASSIFICATION_CLEAR
+    if episode_id is None:
+        if not concerning:
+            return ReplyOutcome(kind=REPLY_KIND_UNRELATED, episode_id=None, classification=None)
+        return _escalate_uncorrelated_tripwire(txn, config, envelope, now_utc, local_day)
+
+    classification = CLASSIFICATION_CONCERNING if concerning else CLASSIFICATION_CLEAR
+    excerpt = redact_and_bound(envelope.text)
     txn.append_event(
         ts_utc=now_utc,
         local_day=local_day,
@@ -293,17 +355,16 @@ def _process_parent_reply(
         episode_id=episode_id,
         actor_id=envelope.sender_id,
         source_update_id=envelope.update_id,
-        payload={"classification": classification, "excerpt": redact_and_bound(envelope.text)},
+        payload={"classification": classification, "excerpt": excerpt},
     )
 
     if classification == CLASSIFICATION_CONCERNING:
-        _enqueue(
+        _enqueue_concern_escalation(
             txn,
+            config,
             episode_id=episode_id,
             step=f"concern:{envelope.message_id}",
-            chat_id=config.roster.group.chat_id,
-            text=_message(config, "escalation_concern", parent_name=config.roster.parent.name),
-            priority=PRIORITY_ESCALATION,
+            excerpt=excerpt,
             now_utc=now_utc,
         )
         txn.append_event(

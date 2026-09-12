@@ -23,8 +23,14 @@ from care.checkins import (
 )
 from care.clock import FixedClock
 from care.config import load_config
-from care.delivery import DeliveryResult, DeliveryWorker, Transport
-from care.models import UpdateEnvelope, checkin_episode_id, dose_episode_id, make_action_key
+from care.delivery import PRIORITY_ESCALATION, DeliveryResult, DeliveryWorker, Transport
+from care.models import (
+    UpdateEnvelope,
+    checkin_episode_id,
+    dose_episode_id,
+    escalation_episode_id,
+    make_action_key,
+)
 from care.service import CareService
 from care.store import Store
 
@@ -515,3 +521,168 @@ def test_checkin_ladder_crosses_fall_back_boundary(store, config):
             ))
     assert outcome.classification == CLASSIFICATION_CLEAR
     assert store.get_outbox_by_action_key(make_action_key(episode_id, STEP_STAND_DOWN)) is not None
+
+
+def test_tripwire_reply_escalates_with_zero_open_episodes(store, config):
+    reply_time = datetime(2026, 9, 14, 10, 0, tzinfo=UTC)
+    envelope = _envelope(
+        100,
+        chat_id=config.roster.parent.chat_id,
+        sender_id="parent",
+        text="I fell and can't get up",
+        reply_to=None,
+        received_at=reply_time,
+    )
+    outcome = _handle_reply(store, config, FixedClock(reply_time), envelope)
+
+    assert outcome.kind == REPLY_KIND_PARENT
+    assert outcome.classification == CLASSIFICATION_CONCERNING
+
+    standalone_episode_id = escalation_episode_id(f"concern:{envelope.message_id}")
+    row = store.get_outbox_by_action_key(make_action_key(standalone_episode_id, STEP_ESCALATION))
+    assert row is not None
+    assert row.chat_id == config.roster.group.chat_id
+    assert row.priority == PRIORITY_ESCALATION
+
+    escalations = [r for r in store.list_outbox() if r.chat_id == config.roster.group.chat_id]
+    assert len(escalations) == 1
+
+
+def test_tripwire_reply_escalates_exactly_once_with_two_open_episodes(store, config):
+    day1_enqueue = datetime(2026, 9, 13, 6, 5, tzinfo=UTC)
+    run_checkin_tick(store, config, FixedClock(day1_enqueue))
+    _deliver_due(store, NumericReceiptTransport(start=1000), day1_enqueue)
+
+    day2_enqueue = datetime(2026, 9, 14, 6, 5, tzinfo=UTC)
+    run_checkin_tick(store, config, FixedClock(day2_enqueue))
+    _deliver_due(store, NumericReceiptTransport(start=2000), day2_enqueue)
+
+    reply_time = day2_enqueue + timedelta(minutes=10)
+    envelope = _envelope(
+        101,
+        chat_id=config.roster.parent.chat_id,
+        sender_id="parent",
+        text="я впала у ванній і не можу встати",
+        reply_to=None,
+        received_at=reply_time,
+    )
+    outcome = _handle_reply(store, config, FixedClock(reply_time), envelope)
+
+    assert outcome.kind == REPLY_KIND_PARENT
+    assert outcome.classification == CLASSIFICATION_CONCERNING
+    assert outcome.episode_id not in (
+        checkin_episode_id(date(2026, 9, 13)),
+        checkin_episode_id(date(2026, 9, 14)),
+    )
+
+    escalations = [
+        r for r in store.list_outbox()
+        if r.chat_id == config.roster.group.chat_id and r.priority == PRIORITY_ESCALATION
+    ]
+    assert len(escalations) == 1
+    assert store.get_outbox_by_action_key(make_action_key(checkin_episode_id(date(2026, 9, 13)), STEP_ESCALATION)) is None
+    assert store.get_outbox_by_action_key(make_action_key(checkin_episode_id(date(2026, 9, 14)), STEP_ESCALATION)) is None
+
+
+def test_tripwire_reply_with_one_open_episode_still_correlates_and_escalates(store, config):
+    episode_id = checkin_episode_id(date(2026, 9, 14))
+    enqueue_time = datetime(2026, 9, 14, 6, 5, tzinfo=UTC)
+    run_checkin_tick(store, config, FixedClock(enqueue_time))
+    _deliver_due(store, NumericReceiptTransport(), enqueue_time)
+
+    reply_time = enqueue_time + timedelta(minutes=10)
+    envelope = _envelope(
+        102,
+        chat_id=config.roster.parent.chat_id,
+        sender_id="parent",
+        text="I fell and can't get up",
+        reply_to=None,
+        received_at=reply_time,
+    )
+    outcome = _handle_reply(store, config, FixedClock(reply_time), envelope)
+
+    assert outcome.kind == REPLY_KIND_PARENT
+    assert outcome.classification == CLASSIFICATION_CONCERNING
+    assert outcome.episode_id == episode_id
+
+    concern_row = store.get_outbox_by_action_key(make_action_key(episode_id, f"concern:{envelope.message_id}"))
+    assert concern_row is not None
+    assert concern_row.chat_id == config.roster.group.chat_id
+
+    standalone_episode_id = escalation_episode_id(f"concern:{envelope.message_id}")
+    assert store.get_outbox_by_action_key(make_action_key(standalone_episode_id, STEP_ESCALATION)) is None
+
+
+def test_ordinary_clear_reply_with_two_open_episodes_stays_unrelated(store, config):
+    day1_enqueue = datetime(2026, 9, 13, 6, 5, tzinfo=UTC)
+    run_checkin_tick(store, config, FixedClock(day1_enqueue))
+    _deliver_due(store, NumericReceiptTransport(start=1000), day1_enqueue)
+
+    day2_enqueue = datetime(2026, 9, 14, 6, 5, tzinfo=UTC)
+    run_checkin_tick(store, config, FixedClock(day2_enqueue))
+    _deliver_due(store, NumericReceiptTransport(start=2000), day2_enqueue)
+
+    reply_time = day2_enqueue + timedelta(minutes=10)
+    outcome = _handle_reply(store, config, FixedClock(reply_time), _envelope(
+                103,
+                chat_id=config.roster.parent.chat_id,
+                sender_id="parent",
+                text="all good here, just tired",
+                reply_to=None,
+                received_at=reply_time,
+            ))
+
+    assert outcome.kind == REPLY_KIND_UNRELATED
+    assert outcome.episode_id is None
+    assert outcome.classification is None
+
+    assert not [r for r in store.list_outbox() if r.chat_id == config.roster.group.chat_id]
+    assert store.get_outbox_by_action_key(make_action_key(checkin_episode_id(date(2026, 9, 13)), STEP_STAND_DOWN)) is None
+    assert store.get_outbox_by_action_key(make_action_key(checkin_episode_id(date(2026, 9, 14)), STEP_STAND_DOWN)) is None
+
+
+def test_replaying_tripwire_update_id_produces_exactly_one_escalation(store, config):
+    reply_time = datetime(2026, 9, 14, 10, 0, tzinfo=UTC)
+    envelope = _envelope(
+        104,
+        chat_id=config.roster.parent.chat_id,
+        sender_id="parent",
+        text="I fell and can't get up",
+        reply_to=None,
+        received_at=reply_time,
+    )
+    service = CareService(store=store, config=config, clock=FixedClock(reply_time))
+
+    first = service.handle_reply(envelope)
+    second = service.handle_reply(envelope)
+
+    assert first.replay is False
+    assert second.replay is True
+    assert second.result == first.result
+
+    escalations = [r for r in store.list_outbox() if r.chat_id == config.roster.group.chat_id]
+    assert len(escalations) == 1
+
+
+def test_concern_escalation_message_quotes_the_parents_words(store, config):
+    episode_id = checkin_episode_id(date(2026, 9, 14))
+    enqueue_time = datetime(2026, 9, 14, 6, 5, tzinfo=UTC)
+    run_checkin_tick(store, config, FixedClock(enqueue_time))
+    _deliver_due(store, NumericReceiptTransport(), enqueue_time)
+
+    reply_time = enqueue_time + timedelta(minutes=10)
+    distinctive_text = "I fell in the bathroom and can't get up"
+    envelope = _envelope(
+        105,
+        chat_id=config.roster.parent.chat_id,
+        sender_id="parent",
+        text=distinctive_text,
+        reply_to=None,
+        received_at=reply_time,
+    )
+    outcome = _handle_reply(store, config, FixedClock(reply_time), envelope)
+    assert outcome.classification == CLASSIFICATION_CONCERNING
+
+    concern_row = store.get_outbox_by_action_key(make_action_key(episode_id, f"concern:{envelope.message_id}"))
+    assert concern_row is not None
+    assert distinctive_text in concern_row.text

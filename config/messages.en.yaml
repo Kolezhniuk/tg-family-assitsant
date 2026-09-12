@@ -1,0 +1,13 @@
+language: en
+messages:
+  checkin_prompt: "Good morning! How are you feeling today?"
+  checkin_nudge: "Just checking in again — how are things?"
+  dose_reminder: "Time for {label}."
+  dose_nudge: "Friendly reminder about {label}."
+  escalation_silence: "We haven't heard back from {parent_name} today and are checking with the family."
+  escalation_concern: "{parent_name} sent a message that needs attention."
+  clarify_question: "Could you tell us a little more about that?"
+  stand_down: "Thanks for letting us know — glad things are okay."
+  stop_notice: "{parent_name} asked the check-ins to stop. The family has been notified."
+  pause_notice: "Check-ins are paused until {until}."
+  resume_notice: "Check-ins have resumed."

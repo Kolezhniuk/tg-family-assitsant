@@ -1,0 +1,20 @@
+language: en
+entries:
+  - category: "yes"
+    mode: word
+    terms:
+      - "yes"
+      - yep
+      - yeah
+
+  - category: took_dose
+    mode: prefix
+    terms:
+      - took
+      - taken
+
+  - category: ok
+    mode: word
+    terms:
+      - ok
+      - okay

@@ -1,0 +1,9 @@
+- id: bp_morning
+  label: the blood pressure tablet
+  time: "08:30"
+  weekdays: [mon, tue, wed, thu, fri, sat, sun]
+
+- id: heart_evening
+  label: the evening heart pill
+  time: "20:00"
+  weekdays: [mon, tue, wed, thu, fri, sat, sun]

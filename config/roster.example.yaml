@@ -1,0 +1,32 @@
+timezone: Europe/Kyiv
+
+quiet_hours:
+  start: "21:30"
+  end: "08:00"
+
+checkin:
+  time: "09:00"
+  nudge_after_minutes: 180
+  escalate_after_minutes: 360
+
+languages:
+  - uk
+  - en
+
+delivery:
+  mode: dry-run
+
+state:
+  path: ~/.hermes/profiles/telegram-family-assistant/workspace/care-state.db
+
+parent:
+  chat_id: "11111111"
+  name: Mum
+
+group:
+  chat_id: "-1001234567890"
+  name: Family group
+
+family:
+  - chat_id: "22222222"
+    name: Dima

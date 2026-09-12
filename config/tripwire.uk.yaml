@@ -1,0 +1,27 @@
+language: uk
+entries:
+  - category: fall
+    mode: prefix
+    terms:
+      - впа
+
+  - category: cannot_get_up
+    mode: phrase
+    terms:
+      - не можу встати
+
+  - category: chest_pain
+    mode: phrase
+    terms:
+      - болить в грудях
+      - болить серце
+
+  - category: cannot_breathe
+    mode: phrase
+    terms:
+      - не можу дихати
+
+  - category: call_ambulance
+    mode: prefix
+    terms:
+      - швидк

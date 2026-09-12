@@ -1,5 +1,13 @@
 # Operations runbook
 
+> **STATUS — READ FIRST.** Parts of this runbook describe an operator CLI (`care status`,
+> `care log`, `care doctor`, `care triage`, `care tick`, `care deliver`) that is **NOT BUILT YET**.
+> `python3 -m care` currently exits 1 with "not implemented". Those sections are the intended
+> design, retained so the setup they describe stays reviewable — they are not instructions you can
+> follow today. What *is* runnable right now is `demo/care_demo.py`, which drives the same state
+> machines directly. The Telegram group and privacy-mode setup in Part 1 and Part 2 below IS
+> accurate and verified, and does not depend on the CLI.
+
 Everything needed to take the bot from "exists" to "checking in on a real
 person", plus what to do when it misbehaves.
 

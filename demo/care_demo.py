@@ -128,11 +128,11 @@ def main() -> int:
         message_id=55001,
         reply_to_message_id=None,
         received_at_utc=clock.now_utc(),
-        text="я впала у ванній і не можу встати",
+        text="I fell in the bathroom and I cannot get up",
     )
     outcome = service.handle_reply(envelope)
     worker.run_once()
-    print('09:12  parent replies: "я впала у ванній і не можу встати"')
+    print('09:12  parent replies: "I fell in the bathroom and I cannot get up"')
     print(f"  classified: {outcome.result.get('classification')}")
     seen = show_sent(transport, seen)
 

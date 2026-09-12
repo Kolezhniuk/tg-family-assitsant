@@ -11,11 +11,11 @@ Be skeptical of anything that sounds finished — most of this is domain logic e
 - The durable outbox and delivery worker (`care/delivery.py`, `care/store.py`): transactional enqueue, lease-based claiming, retry with bounded backoff, at-least-once delivery via `hermes send`, MarkdownV2 neutralisation of outgoing text.
 - Config validation (`care/config.py`) for `roster.yaml` and `meds.yaml`, and the Ukrainian/English term catalogues (`care/triage.py`).
 - Dosage redaction and excerpt bounding (`care/redaction.py`).
+- The medication ladder (`care/meds.py`): reminder, quiet-hour suppression, nudge at +45m, close as `unconfirmed` at +120m, `✅`/affirmative confirmation gated on negation, and an adherence notice at most once per rolling 24h.
 - Outbound messaging: a message that reaches `hermes send` and gets a real Telegram `message_id` back works today, demonstrated in `demo/care_demo.py`.
 
 **Not built, or only partially built:**
 - **Inbound Telegram replies are not wired.** Live ingress needs a Hermes `pre_gateway_dispatch` plugin (documented in `docs/hermes-contract.md`) that hands trusted update metadata to `care` before any model sees the message. That plugin does not exist. Today, replies are injected by constructing an `UpdateEnvelope` directly in Python and calling `CareService.handle_reply(...)` — see how `demo/care_demo.py` does it. Nothing a parent types into Telegram reaches this code yet.
-- **Medication reminders have no state machine.** `meds.yaml` is validated and its dose ids/labels/times/weekdays are checked, and `care/models.py` has an episode-id helper for doses (`dose_episode_id`), but there is no reminder tick, no confirmation logic, no nudge, no adherence notice — no `care/meds.py` exists. Section 10 of the design spec is not implemented.
 - **There is no operator CLI.** `care/__main__.py` says so directly: *"care CLI is not implemented yet (see care/cli.py, a later task)"*. None of `care run`, `care tick`, `care deliver`, `care status`, `care log`, `care doctor`, `care triage`, `care purge`, `care config-import` exist. The only executable entry point today is `demo/care_demo.py`, which imports `care.service.CareService` and `care.delivery.DeliveryWorker` directly and drives them from a movable in-process clock.
 - The model conversation boundary (`conversation` component in the design spec — clarifying questions, `clear`/`unclear` judgement) is not built.
 - Typed runtime controls (snooze, skip, pause, stop, resume, schedule mutation) are not built.
@@ -36,7 +36,7 @@ flowchart TD
     TRIAGE["deterministic ingest\ntriage + checkins"]
     STORE[("single SQLite store\nincoming ids · event log · outbox")]
     TICK["check-in state machine"]
-    MEDS["medication state machine\nNOT BUILT"]
+    MEDS["medication state machine"]
     WORKER["delivery worker\nclaims outbox row by lease"]
     SEND["hermes send"]
     TELE["Telegram"]
@@ -49,12 +49,12 @@ flowchart TD
     GATE -.->|optional context| MODEL
     MODEL -.->|may add care, never remove it| TRIAGE
     CFG --> TICK
-    CFG -.-> MEDS
+    CFG --> MEDS
     TRIAGE --> STORE
     STORE -->|event log feeds| TICK
-    STORE -.->|event log would feed| MEDS
+    STORE -->|event log feeds| MEDS
     TICK -->|due actions| STORE
-    MEDS -.->|due actions — not implemented| STORE
+    MEDS -->|due actions| STORE
     STORE -->|claim due row, lease| WORKER
     WORKER -->|send outside the transaction| SEND
     WORKER -->|record receipt| STORE
@@ -63,7 +63,7 @@ flowchart TD
     TELE --> GROUP
 ```
 
-Everything solid in this diagram is deterministic — plain Python state machines and SQL transactions. The dashed boxes and arrows (the Telegram ingress adapter, the model turn, the medication state machine) are the parts described in the design spec that do not exist in code today.
+Everything solid in this diagram is deterministic — plain Python state machines and SQL transactions. The dashed boxes and arrows — the Telegram ingress adapter and the model turn — are the parts described in the design spec that do not exist in code today.
 
 ### The check-in ladder
 
@@ -100,9 +100,71 @@ A tripwire hit (`ConcernEscalation`) can happen from any state and pre-empts the
 
 Every parent reply is checked against the tripwire term lists (`config/tripwire.uk.yaml`, `config/tripwire.en.yaml`) before anything else. A hit redacts and bounds the message (`care/redaction.py`), correlates it to an open check-in episode if one exists (by `reply_to_message_id`, or by single-open-episode fallback), and enqueues an immediate escalation to the family group quoting the redacted excerpt — in the same transaction, so the escalation is durable the instant the tripwire fires. This happens regardless of what the parent says afterward: nothing in the reply text, and no model, can cancel a queued escalation.
 
-### Medication (as designed — not implemented)
+### Medication
 
-`meds.yaml` config validates today, but there is no code path that turns a due dose into a reminder, nudge, confirmation, or adherence notice. As designed (§10 of the spec): a reminder goes out at the dose's local time; if undelivered, no adherence penalty accrues (only delivered reminders count); if delivered and unconfirmed, a nudge follows at `+45m` and the dose closes `unconfirmed` (never `missed`) at `+120m`; a direct affirmative reply with no negation confirms it; two unconfirmed dose episodes in a day, or the same dose unconfirmed on consecutive days, would trigger at most one adherence notice per rolling 24 hours, explicitly stating that unconfirmed does not mean skipped.
+A reminder is enqueued at the dose's local time, inside its own window; a reminder scheduled inside quiet hours is suppressed outright rather than deferred to the morning. Confirmation only becomes possible once the reminder was actually **delivered** — an outbox row is not a sent message. A delivered, unconfirmed dose is nudged at `+45m` and closed as `unconfirmed` at `+120m`. It is never recorded or reported as *missed*: the system knows only that no confirmation arrived, and most unconfirmed doses are someone who took the pill and put the phone down. Confirmation uses `confirms_dose` — an affirmative match with no negation — so `не випила` ("didn't take it") can never register as taken. Reminders that were never delivered, or were quiet-hour suppressed, are excluded from adherence entirely. Two unconfirmed doses in one day, or the same dose unconfirmed on consecutive days, produces at most one adherence notice per rolling 24 hours, worded so it does not assert the medication was skipped.
+
+**Known limitation:** the consecutive-day rule uses calendar-day adjacency, not the dose's own weekday schedule. Correct for daily doses; a Monday-to-Friday dose would treat Friday and Monday as consecutive. Fix before deploying a non-daily dose.
+
+## Demo scenarios
+
+`demo/care_demo.py` drives these against real state and a real transport. Run it with no arguments for a preview that sends nothing; add `--send` to deliver through `hermes send`. A movable clock fast-forwards a day in seconds, so each case takes about a second rather than six hours.
+
+### 1. Silence — nobody answers all day
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as care tick
+    participant P as Parent DM
+    participant G as Family group
+    C->>P: 09:00 "Good morning! How are you feeling today?"
+    Note over C,P: delivered, receipt stored
+    C->>P: 12:00 nudge (+3h, still no reply)
+    C->>G: 15:00 "We haven't heard back from Mum today"
+    Note over C,G: one escalation per day; nudging stops
+```
+
+### 2. A concerning reply — immediate escalation
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant P as Parent DM
+    participant C as care ingest
+    participant G as Family group
+    C->>P: 09:00 check-in
+    P->>C: 09:12 "I fell in the bathroom and I cannot get up"
+    Note over C: tripwire matches before any judgement
+    C->>G: "Mum sent a message that needs attention: <quote>"
+    Note over C,G: quote is redacted and bounded, never interpreted
+```
+
+Escalation here does **not** depend on correlating the reply to a check-in. If the system cannot work out which episode a tripwire message belongs to, it escalates anyway — ambiguity makes it escalate more readily, never less.
+
+### 3. Medication — one confirmed, one not
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as meds tick
+    participant P as Parent DM
+    participant G as Family group
+    C->>P: 08:30 "Time for the blood pressure tablet."
+    P->>C: 08:41 ✅
+    Note over C: dose_confirmed, no model involved
+    C->>P: 20:00 "Time for the evening heart pill."
+    C->>P: 20:50 nudge (+45m)
+    Note over C: 22:10 closed unconfirmed — nothing sent
+    C->>G: next day, repeat → one adherence notice
+    Note over C,G: "Unconfirmed does not mean it was skipped"
+```
+
+A single unconfirmed dose is deliberately silent. Telling the family every time would train them to ignore the channel escalations arrive on.
+
+### What the demo cannot show
+
+Replying in Telegram does nothing — inbound ingress is not wired (see **Current status**). The demo injects replies by constructing an `UpdateEnvelope` and calling `CareService.handle_reply(...)` directly. Everything outbound is real: real `hermes send`, real Telegram `message_id` as the receipt.
 
 ## Configuration
 

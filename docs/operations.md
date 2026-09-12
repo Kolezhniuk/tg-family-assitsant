@@ -100,7 +100,7 @@ group:
 family:
   - chat_id: "22222222"
     name: Dima
-  - chat_id: "22222222"
+  - chat_id: "33333333"
     name: Tëma
 ```
 

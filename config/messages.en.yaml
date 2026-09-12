@@ -5,6 +5,7 @@ messages:
   dose_reminder: "Time for {label}."
   dose_nudge: "Friendly reminder about {label}."
   escalation_silence: "We haven't heard back from {parent_name} today and are checking with the family."
+  checkin_delivery_failed: "We could not reach {parent_name} to send today's check-in."
   escalation_concern: "{parent_name} sent a message that needs attention."
   clarify_question: "Could you tell us a little more about that?"
   stand_down: "Thanks for letting us know — glad things are okay."

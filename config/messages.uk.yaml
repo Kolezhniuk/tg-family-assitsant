@@ -5,6 +5,7 @@ messages:
   dose_reminder: "Час прийняти {label}."
   dose_nudge: "Нагадування про {label}."
   escalation_silence: "Ми не отримали відповіді від {parent_name} сьогодні і зв'язуємось із родиною."
+  checkin_delivery_failed: "Не вдалося надіслати {parent_name} сьогоднішнє повідомлення для перевірки."
   escalation_concern: "{parent_name} надіслав(ла) повідомлення, яке потребує уваги."
   clarify_question: "Розкажіть, будь ласка, трохи більше про це."
   stand_down: "Дякуємо, що повідомили — раді, що все гаразд."

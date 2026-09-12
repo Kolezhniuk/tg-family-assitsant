@@ -422,9 +422,6 @@ class Store:
                 self._conn.execute("COMMIT")
                 return UpdateOutcome(replay=True, result=json.loads(row["result"]))
 
-            txn = WriteTxn(self._conn)
-            result = handler(txn)
-            result_json = json.dumps(result, sort_keys=True)
             self._conn.execute(
                 "INSERT INTO incoming_updates"
                 " (update_id, chat_id, chat_type, sender_id, message_id, reply_to_message_id,"
@@ -439,8 +436,15 @@ class Store:
                     envelope.reply_to_message_id,
                     _iso(envelope.received_at_utc),
                     _iso(processed_at_utc),
-                    result_json,
+                    "null",
                 ),
+            )
+            txn = WriteTxn(self._conn)
+            result = handler(txn)
+            result_json = json.dumps(result, sort_keys=True)
+            self._conn.execute(
+                "UPDATE incoming_updates SET result = ? WHERE update_id = ?",
+                (result_json, envelope.update_id),
             )
             self._conn.execute("COMMIT")
             return UpdateOutcome(replay=False, result=result)

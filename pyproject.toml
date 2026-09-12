@@ -1,0 +1,19 @@
+[project]
+name = "care"
+version = "0.1.0"
+description = "Telegram family care-check agent domain logic"
+requires-python = ">=3.12"
+dependencies = ["PyYAML"]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["care*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -1,0 +1,13 @@
+language: uk
+entries:
+  - category: "no"
+    mode: word
+    terms:
+      - ні
+      - нема
+      - немає
+
+  - category: not_yet
+    mode: word
+    terms:
+      - не

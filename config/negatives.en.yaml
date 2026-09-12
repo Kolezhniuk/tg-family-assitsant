@@ -1,0 +1,16 @@
+language: en
+entries:
+  - category: "no"
+    mode: word
+    terms:
+      - "no"
+      - nope
+
+  - category: not_yet
+    mode: word
+    terms:
+      - not
+      - didnt
+      - didn't
+      - havent
+      - haven't

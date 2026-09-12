@@ -4,3 +4,11 @@ __pycache__/
 .pytest_cache/
 config/roster.yaml
 config/meds.yaml
+
+# stray ssh keypair - do not commit
+/yes
+/yes.pub
+.venv/
+.demo/
+.demo2/
+.demo3/

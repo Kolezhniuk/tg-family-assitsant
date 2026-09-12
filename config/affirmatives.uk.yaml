@@ -1,0 +1,15 @@
+language: uk
+entries:
+  - category: "yes"
+    mode: word
+    terms:
+      - так
+      - ага
+      - угу
+
+  - category: took_dose
+    mode: prefix
+    terms:
+      - випи
+      - прийня
+      - взя

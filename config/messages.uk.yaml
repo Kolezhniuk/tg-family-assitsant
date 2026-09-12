@@ -1,0 +1,16 @@
+language: uk
+messages:
+  checkin_prompt: "Доброго ранку! Як ви себе почуваєте сьогодні?"
+  checkin_nudge: "Ще раз перевіряємо — як справи?"
+  dose_reminder: "Час прийняти {label}."
+  dose_nudge: "Нагадування про {label}."
+  dose_delivery_failed: "Не вдалося нагадати {parent_name} про {label}."
+  dose_adherence_notice: "Ми не змогли підтвердити, що {parent_name} нещодавно прийняв(ла) ліки. Непідтверджено — не означає пропущено: можливо, ліки вже прийняті, а відповідь просто не надіслана."
+  escalation_silence: "Ми не отримали відповіді від {parent_name} сьогодні і зв'язуємось із родиною."
+  checkin_delivery_failed: "Не вдалося надіслати {parent_name} сьогоднішнє повідомлення для перевірки."
+  escalation_concern: "{parent_name} надіслав(ла) повідомлення, яке потребує уваги: «{excerpt}»"
+  clarify_question: "Розкажіть, будь ласка, трохи більше про це."
+  stand_down: "Дякуємо, що повідомили — раді, що все гаразд."
+  stop_notice: "{parent_name} попросив(ла) зупинити перевірки. Родину повідомлено."
+  pause_notice: "Перевірки призупинено до {until}."
+  resume_notice: "Перевірки відновлено."

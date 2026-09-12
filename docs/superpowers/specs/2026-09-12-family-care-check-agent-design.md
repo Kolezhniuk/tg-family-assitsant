@@ -39,10 +39,21 @@ split, and it is destroyed by routine chatter — the design deliberately has
 no daily "all fine" digest.
 
 The bot lives in the family group as a member. Posting to a group requires
-nothing special. **Reading** the group requires BotFather privacy mode to be
-turned **off**, which is needed for the stand-down behaviour in §5.4 and for
-the conversational control surface in §8. This is a setup prerequisite, not a
-code concern; see `docs/operations.md`.
+nothing special — `hermes send --to telegram:<group_id>` works the moment the
+bot is a member.
+
+**Reading** the group is gated by Telegram's bot privacy mode, which is on by
+default. With it on, the bot receives only slash commands, replies to its own
+messages, and service messages. Turning it off — or, preferably, promoting
+the bot to group admin, which bypasses the setting without changing it
+globally for every group the bot is in — delivers everything. This is needed
+for the stand-down acknowledgement in §5.4 and the conversational control
+surface in §8. Full procedure in `docs/operations.md`.
+
+The design degrades cleanly if neither is done: escalations, check-ins,
+reminders and the whole ladder still work, because they are sends. Only
+passive group awareness is lost, and the escalation message already asks for
+an explicit reply rather than relying on it.
 
 ## 3. Architecture
 
@@ -128,13 +139,15 @@ config/
   roster.example.yaml
   meds.example.yaml
   tripwire.en.yaml
-  tripwire.ru.yaml
+  tripwire.uk.yaml
+  affirmatives.en.yaml
+  affirmatives.uk.yaml
 scripts/
   care-tick.sh                    cron entry point
   install-profile.sh              copies SOUL.md and config fragment into the Hermes profile
 profile/
   SOUL.md                         agent persona and boundaries, versioned here
-  config-fragment.yaml            platform_toolsets, skills.external_dirs, safety-gate
+  config-fragment.yaml            telegram group gates, platform_toolsets, skills.external_dirs, safety-gate
 skills/
   family-care/SKILL.md            agent-side skill: how to call the CLI on every reply
 tests/
@@ -197,23 +210,33 @@ group at 23:40.
 If the parent replies after a silence escalation has been posted, the agent
 posts a stand-down to the group naming the time of the reply and quoting it.
 
-If group reading is enabled (privacy mode off) and a family member posts in
-the group within 30 minutes of an escalation, the agent records that the
-escalation was acknowledged and does not re-raise the same day. It does
-**not** infer resolution from arbitrary chatter: acknowledgement requires a
-message that replies to, or mentions, the bot — the agent asks for exactly
-that in its escalation message ("reply here once someone has reached her").
+Acknowledgement by a family member is recorded when someone replies to the
+bot's escalation message, or mentions the bot, within 30 minutes. The agent
+then does not re-raise the same day. It does **not** infer resolution from
+arbitrary chatter — the escalation message asks for exactly the gesture it
+needs: *"reply to this message once someone has reached her."*
+
+This choice is forced by how Hermes handles groups, and it is the right one
+anyway. With `require_mention: true` and
+`observe_unmentioned_group_messages: true`, ordinary group chatter is folded
+into the session transcript as context but does **not** dispatch the agent —
+only a reply or a mention does. So a sibling typing "I called her, all fine"
+into the void is visible later but triggers nothing in the moment; a reply to
+the bot triggers the stand-down immediately. Requiring the deliberate gesture
+makes the acknowledgement an explicit act by a named person, recorded with
+their chat id, rather than an inference from whoever happened to type
+something reassuring.
 
 ## 6. Reading replies
 
 ### 6.1 Two layers
 
 **Tripwire — deterministic, unconditional.** A curated term list, normalised
-(case-folded, accent-stripped, punctuation-stripped) and matched as whole
-words or phrases. A hit escalates immediately, without model involvement, and
-the escalation message is composed by the CLI. Term lists ship per language
-in `config/tripwire.*.yaml`; English and Russian are both enabled by default,
-since the family writes in both.
+(case-folded, punctuation-stripped, Cyrillic homoglyphs folded) and matched
+as whole words or phrases. A hit escalates immediately, without model
+involvement, and the escalation message is composed by the CLI. Term lists
+ship per language in `config/tripwire.*.yaml`; **Ukrainian and English** are
+both enabled by default, since the family writes in both.
 
 Seed categories: falls, chest pain, breathlessness, bleeding, confusion or
 disorientation, sudden weakness, explicit calls for help, explicit statements
@@ -222,6 +245,46 @@ of not being okay, statements about having stopped taking medication.
 The list is data, not code, and is expected to be edited over time. Terms are
 matched, not interpreted — `care triage` prints the matched term so a false
 positive is traceable to a line in a YAML file.
+
+#### Matching modes, and why Ukrainian needs them
+
+Whole-word matching is wrong for Ukrainian. The language inflects heavily,
+so a single concept has many surface forms: *впала, впав, впали, упала,
+падаю*. Enumerating every form by hand guarantees the one that gets typed at
+04:00 is the one nobody listed.
+
+Each term therefore declares how it matches:
+
+```yaml
+terms:
+  - match: prefix
+    value: "впал"
+    note: fell (feminine, masculine, plural)
+  - match: prefix
+    value: "упал"
+  - match: phrase
+    value: "не можу встати"
+  - match: word
+    value: "кров"
+```
+
+- `prefix` — matches a word starting with the value. Covers inflection with
+  one line. Used for verbs and adjectives.
+- `word` — exact token match. Used where a prefix would over-fire.
+- `phrase` — a normalised token sequence. Used for multi-word idioms such as
+  *не можу дихати*, *болить у грудях*, *викличте швидку*.
+
+`prefix` is chosen over stemming deliberately: a stemmer is a dependency, a
+source of surprises, and untestable by reading. A prefix is auditable by a
+family member who does not write code, which matters because the list is
+meant to be edited by whoever notices a gap.
+
+English keeps `word` and `phrase` and needs no prefixes.
+
+The trade is more false positives, accepted knowingly: a tripwire that fires
+on an innocent message costs one unnecessary group notice, and the family can
+delete the offending line from a YAML file. A tripwire that fails to fire
+costs the thing the agent exists to prevent.
 
 **Soft judgement — model, additive only.** The agent classifies a
 non-tripwire reply as `clear` or `unclear`. `unclear` covers: unusually terse
@@ -297,9 +360,18 @@ as authoritative over the pharmacy label.
 
 Confirmation is recorded by `care confirm --dose <id>`, called either by the
 agent when the parent says they took it, or by a deterministic fast path: a
-bare affirmative (`yes`, `да`, `done`, `ок`, `✅` and similar, per the
-language lists) received inside an open dose window confirms without the
-model.
+bare affirmative (`так`, `добре`, `гаразд`, `випила`, `прийняла`, `готово`,
+`yes`, `done`, `✅` and similar, per the language lists) received inside an
+open dose window confirms without the model.
+
+Affirmatives live in `config/affirmatives.uk.yaml` and
+`config/affirmatives.en.yaml` and use the same matching modes as the tripwire
+lists, so the Ukrainian gendered verb forms (*випила* / *випив*, *прийняла* /
+*прийняв*) are one `prefix` entry each rather than four `word` entries.
+
+Tripwire matching runs **before** the affirmative fast path. A message that
+hits both — *"так, випила, але дуже болить голова"* — escalates; it does not
+quietly close the dose and stop there.
 
 ### 7.3 Unconfirmed is not missed
 
@@ -443,6 +515,8 @@ Scenario tests, each asserting the exact sequence of sends:
 6. unclear then still unclear — escalation quoting both messages
 7. parent asks the agent not to tell — escalation still posted
 8. dose confirmed by bare affirmative — no model involved
+8b. Ukrainian inflection — `впала`, `впав`, `упали` all trip one `prefix` term
+8c. affirmative plus tripwire in one message — escalates, does not just confirm
 9. dose unconfirmed two days running — one adherence escalation, not two
 10. two doses unconfirmed in one day — one adherence escalation
 11. quiet hours — evening dose after 21:30 dropped, recorded as suppressed
@@ -460,10 +534,14 @@ Scenario tests, each asserting the exact sequence of sends:
    knows only two DMs: Tëma (`11111111`) and Dima K (`22222222`). The bot
    must be added to the group and one message sent there before Hermes learns
    the chat id. Until then `roster.yaml` cannot be completed.
-2. **BotFather privacy mode** must be turned off for the stand-down
-   acknowledgement (§5.4) and the group control surface (§8). Without it the
-   system still works, minus those two behaviours; the design degrades
-   cleanly and `care doctor` reports which mode is in effect.
+2. **Group message delivery** must be opened up — either BotFather privacy
+   mode off, or the bot promoted to group admin — for the stand-down
+   acknowledgement (§5.4) and the group control surface (§8), plus the
+   matching `telegram.group_allowed_chats` / `require_mention` /
+   `observe_unmentioned_group_messages` settings in the profile config.
+   Without it the system still works, minus those two behaviours. Step by
+   step in `docs/operations.md`; `care doctor` reports which mode is in
+   effect and warns when the config and the Telegram side disagree.
 3. **There is no parent in the directory.** Development and acceptance use a
    stand-in DM plus `dry-run`, so no real check-ins go out before the roster
    is real.

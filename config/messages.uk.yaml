@@ -4,6 +4,8 @@ messages:
   checkin_nudge: "Ще раз перевіряємо — як справи?"
   dose_reminder: "Час прийняти {label}."
   dose_nudge: "Нагадування про {label}."
+  dose_delivery_failed: "Не вдалося нагадати {parent_name} про {label}."
+  dose_adherence_notice: "Ми не змогли підтвердити, що {parent_name} нещодавно прийняв(ла) ліки. Непідтверджено — не означає пропущено: можливо, ліки вже прийняті, а відповідь просто не надіслана."
   escalation_silence: "Ми не отримали відповіді від {parent_name} сьогодні і зв'язуємось із родиною."
   checkin_delivery_failed: "Не вдалося надіслати {parent_name} сьогоднішнє повідомлення для перевірки."
   escalation_concern: "{parent_name} надіслав(ла) повідомлення, яке потребує уваги: «{excerpt}»"

@@ -4,6 +4,8 @@ messages:
   checkin_nudge: "Just checking in again — how are things?"
   dose_reminder: "Time for {label}."
   dose_nudge: "Friendly reminder about {label}."
+  dose_delivery_failed: "We could not reach {parent_name} to remind them about {label}."
+  dose_adherence_notice: "We haven't been able to confirm {parent_name} took some medication recently. Unconfirmed does not mean it was skipped — they may have taken it without replying."
   escalation_silence: "We haven't heard back from {parent_name} today and are checking with the family."
   checkin_delivery_failed: "We could not reach {parent_name} to send today's check-in."
   escalation_concern: "{parent_name} sent a message that needs attention: \"{excerpt}\""

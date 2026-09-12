@@ -9,3 +9,4 @@ config/meds.yaml
 /yes
 /yes.pub
 .venv/
+.demo/

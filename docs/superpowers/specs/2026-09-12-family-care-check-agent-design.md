@@ -1,577 +1,388 @@
 # Family Care-Check Agent — Design
 
 Date: 2026-09-12
-Status: proposed
+Status: revised proposal — not approved for live deployment
 Hermes profile: `telegram-family-assistant`
 Repository: `/root/tg-family-assitsant`
 
-## 1. Purpose
+## 1. Purpose and safety boundary
 
-A Telegram agent that checks in on one parent every day, reminds them about
-their medication, and tells the rest of the family when something needs a
-human. It is a presence-and-escalation tool, not a health tool.
+The system checks in with one parent through Telegram, sends medication-label reminders, and tells a family group when a human should make contact. It is a presence-and-escalation tool, not a health tool or emergency service. It must never be presented as the parent's only safety mechanism.
 
-The agent exists because families are spread across generations and time
-zones, and the parent already uses Telegram. The channel is the point: no new
-app, no new login, no device to learn.
+The system never:
 
-### Out of scope, permanently
+- diagnoses, interprets symptoms, or assigns clinical urgency;
+- gives health advice or medical reassurance;
+- recommends starting, stopping, delaying, splitting, or doubling medication;
+- stores configured dosage amounts or repeats dosage amounts to the family;
+- claims a person was contacted unless the transport returned success;
+- lets model output suppress, delay, authorize, or fabricate a required action.
 
-The agent gives no health advice. It does not diagnose, interpret symptoms,
-suggest what a symptom might mean, recommend starting, stopping, splitting or
-doubling a dose, reassure medically ("I'm sure it's nothing"), or triage
-urgency clinically. When a reply sounds worrying, its entire job is to put a
-human in the loop and quote what was said, verbatim.
+When a message is concerning, its only health-adjacent action is to notify the configured family group with a redacted quotation and delivery status. It does not contact emergency services.
 
-## 2. Channel topology
+## 2. Accepted scope
 
-Two Telegram surfaces, with different jobs.
+One deployment supports one parent DM, one family group, a configured family-member allowlist, one daily check-in episode, zero or more label-only medication reminders, Ukrainian and English deterministic term lists, deterministic controls, and optional model-written warmth and one clarifying question.
+
+Multi-parent support, a dashboard, SMS, voice calls, medical records, dosage management, and emergency-service contact are out of scope.
+
+## 3. Trust boundaries and invariants
+
+### 3.1 Trust boundaries
+
+- Telegram text is untrusted input.
+- Sender, chat, update, message, and reply-to identifiers are trusted only when supplied by the Telegram/Hermes adapter, never when inferred by a model or accepted from message text.
+- The model is untrusted for authorization, timing, tripwire suppression, confirmation, and delivery claims.
+- Operator configuration is fully validated before work begins.
+- Hermes is an external dependency. Its hook and send contracts must be verified against the installed version before acceptance.
+
+### 3.2 Non-negotiable invariants
+
+1. A required escalation is never reported delivered without transport success and, when available, a receipt or Telegram message id.
+2. Deterministic incoming-message checks run before optional model reasoning.
+3. Every incoming update has authenticated adapter metadata and replay protection by update id.
+4. A reply closes only its correlated check-in, dose, clarification, or escalation episode.
+5. Every outgoing message uses one durable outbox and retry mechanism.
+6. Model inference may add care but never remove required care.
+7. Dry-run never mutates operational state.
+8. Runtime schedule changes are typed, validated, atomic, and attributable.
+9. The parent may stop immediately; the family notice is durably retried.
+10. Missing or malformed safety configuration prevents startup.
+11. Configured dosage amounts are rejected; dosage-like inbound content is redacted before care persistence or family delivery.
+12. Escalations ignore quiet hours.
+
+## 4. Architecture
+
+The deterministic ingress and timer paths meet in one application service. The model is downstream of deterministic policy.
+
+```text
+Telegram update
+      │ trusted adapter metadata
+      ▼
+Hermes pre-model hook / care adapter
+      │
+      ▼
+care ingest service ───────► optional model directive
+      │                           │
+      │ transaction               │ constrained response tool
+      ▼                           ▼
+SQLite: incoming ids + events + durable outbox
+                              │
+cron: care run ───────────────┤
+                              ▼
+                       delivery worker
+                              │
+                       Hermes send adapter
+                              │
+                    parent DM / family group
+```
+
+`care run` derives and enqueues due actions, then attempts eligible outbox deliveries. It invokes no model.
+
+### 4.1 Required Hermes integration
+
+A skill telling a model to run `care reply` is not deterministic ingress. Live deployment requires a pre-model Hermes hook, plugin, or equivalent adapter that provides immutable Telegram metadata and calls `care ingest` before model handling.
+
+The integration must expose update id, chat id/type, sender id, message id, reply-to id, event timestamp, text, a way to attach the deterministic directive to model handling, and send success/error/receipt data.
+
+If Hermes cannot provide this composition point, live reply processing is blocked. A prompt plus arbitrary terminal command is not an acceptable substitute.
+
+### 4.2 Component boundaries
+
+| Component | Owns | Must not own |
+|---|---|---|
+| `clock` | UTC/local conversion, schedule timestamps, DST policy | state or delivery |
+| `config` | complete validation of operator data | runtime mutation |
+| `redaction` | dosage-like and output-length redaction | triage policy |
+| `triage` | deterministic term matching | model judgement or sending |
+| `store` | transactions, update dedupe, events, episodes, outbox | timing policy |
+| `checkins` | check-in transitions | subprocesses or model calls |
+| `meds` | dose transitions and adherence rules | clinical interpretation |
+| `conversation` | reply directives and clarify budget | chat authorization |
+| `controls` | typed authorized runtime changes | model YAML editing |
+| `service` | coordinate policy and persistence transactionally | Telegram parsing |
+| `delivery` | leases, retries, transport results | deciding what is due |
+| `hermes_adapter` | translate verified Hermes contracts | care policy |
+| `readmodels` | status, log, doctor projections | mutations |
+| `cli` | operator/test entry points | duplicated policy |
+
+Domain modules do not import Hermes. The adapter depends on public application contracts.
+
+## 5. Channel topology
 
 | Surface | Direction | Contents |
 |---|---|---|
-| Parent DM | agent ↔ parent | daily check-in, medication reminders, nudges, clarifying question, pause/snooze |
-| Family group | agent → group, family → agent | escalations, stand-downs, schedule changes, `status` on request |
+| Parent DM | system ↔ parent | check-in, label-only reminders, nudges, one clarification, snooze/skip/stop confirmations |
+| Family group | system → group | escalations, delivery failures requiring action, stand-downs, adherence and control notices |
+| Family group | family → system | replies to escalation and controls routed through authenticated metadata |
 
-The parent's ordinary day is not narrated to the group. The group hears from
-the agent only when something needs attention, so a message from the bot in
-the group always means *look at this*. That signal is the reason for the
-split, and it is destroyed by routine chatter — the design deliberately has
-no daily "all fine" digest.
+Routine successful days are not posted to the group. Telegram privacy/admin behavior and Hermes allowlists remain deployment prerequisites. The adapter rejects unconfigured chats and senders before domain handling.
 
-The bot lives in the family group as a member. Posting to a group requires
-nothing special — `hermes send --to telegram:<group_id>` works the moment the
-bot is a member.
+## 6. Identity, replay protection, and correlation
 
-**Reading** the group is gated by Telegram's bot privacy mode, which is on by
-default. With it on, the bot receives only slash commands, replies to its own
-messages, and service messages. Turning it off — or, preferably, promoting
-the bot to group admin, which bypasses the setting without changing it
-globally for every group the bot is in — delivers everything. This is needed
-for the stand-down acknowledgement in §5.4 and the conversational control
-surface in §8. Full procedure in `docs/operations.md`.
+Every accepted update carries a trusted envelope:
 
-The design degrades cleanly if neither is done: escalations, check-ins,
-reminders and the whole ladder still work, because they are sends. Only
-passive group awareness is lost, and the escalation message already asks for
-an explicit reply rather than relying on it.
-
-## 3. Architecture
-
-A deterministic spine with the model at the edges.
-
-```
-                    cron (*/5)
-                        │
-                  scripts/care-tick.sh
-                        │
-   ┌────────────────────▼─────────────────────┐
-   │  care CLI  (pure state machine)          │
-   │  config → events → due actions → sends   │
-   └────────┬─────────────────────┬───────────┘
-            │                     │
-    hermes send (DM)      hermes send (group)
-            │                     │
-        parent               family group
-            │                     │
-            └──────► gateway ◄────┘
-                        │
-                  Hermes agent
-                 (family-care skill)
-                        │
-                   care CLI  (reply / confirm / schedule)
+```text
+update_id, chat_id, chat_type, sender_id, message_id,
+reply_to_message_id, received_at_utc, text
 ```
 
-**Deterministic, in the CLI — never decided by a model:**
+`update_id` is unique in storage. Replays return the prior result without new events or sends.
 
-- when the check-in goes out, when it is nudged, when it escalates
-- when a medication reminder goes out, when it is nudged, when it is closed
-- the tripwire word list and the immediate escalation it triggers
-- the repeat rule that turns unconfirmed doses into a group message
-- quiet hours, pause, stop
-- the wording of every escalation message posted to the group
+Each interaction belongs to an episode:
 
-**Model-decided, in the agent:**
+- `checkin:<local-day>`;
+- `dose:<dose-id>:<local-day>`;
+- `clarify:<source-message-id>`;
+- `escalation:<logical-action-key>`.
 
-- whether an ordinary-looking reply is nonetheless *off*
-- the single clarifying question, when one is warranted
-- the warmth and phrasing of DMs to the parent
-- interpreting conversational schedule changes in the group
+Outgoing prompt receipts are recorded on their episode. Direct replies correlate through `reply_to_message_id`. Without a reply target, fallback correlation is allowed only when exactly one compatible episode is open for the parent. Otherwise the message does not close an episode automatically. A medication reply never closes a check-in merely because both occur on the same day.
 
-The split follows one rule: **inference may add care, never remove it.** The
-model can cause an escalation that the rules alone would have missed. It can
-never prevent, delay, or soften one the rules require. If the model, the
-model provider, or the whole Hermes gateway is down, the ladder still runs
-and the family is still told — the tick is a script with no LLM in it
-(`hermes cron ... --no-agent`).
+## 7. Time model and windows
 
-### 3.1 Why not the alternatives
+Configured times use `roster.timezone`; storage uses UTC plus local day. Default quiet hours are 21:30–08:00 local. Routine check-ins, nudges, and dose reminders are suppressed during quiet hours; escalations and operational failure notices are not.
 
-*Agent-first* (cron jobs carrying prompts, model decides each tick) was
-rejected: the timers are the safety feature, and a model that reasons poorly
-at 15:00 fails silently — nobody learns that the escalation did not happen.
+### 7.1 DST policy
 
-*Fully deterministic* (no LLM at all) was rejected because it cannot support
-the soft-judgement layer in §6 or the conversational control surface in §8,
-both of which were chosen requirements.
+- A nonexistent spring-forward time moves to the first valid local instant after the gap.
+- An ambiguous fall-back time uses the first occurrence.
+- Logical action keys prevent duplicates during repeated wall-clock time.
 
-## 4. Repository layout
+### 7.2 Catch-up policy
 
-```
-README.md                         setup, daily operation, every command
-docs/
-  superpowers/specs/              this document
-  operations.md                   runbook: install, group registration, dry-run, recovery
-  escalation-policy.md            the ladder in plain language, written for the family to read
-  message-catalogue.md            every deterministic message the CLI can send, verbatim
-care/
-  __init__.py
-  clock.py                        Clock protocol; SystemClock and FixedClock
-  config.py                       roster.yaml + meds.yaml loading and validation
-  state.py                        SQLite append-only event log, derived day state
-  ladder.py                       check-in state machine
-  meds.py                         dose state machine
-  conversation.py                 reply handling, clarify budget, stand-down
-  control.py                      authorisation, pause / skip / stop / schedule
-  triage.py                       tripwire matching, verdict contract
-  messages.py                     deterministic message composition, per-language catalogues
-  delivery.py                     hermes send wrapper, dry-run and capture modes
-  cli.py                          argparse entry points
-bin/care                          executable shim
-config/
-  roster.example.yaml
-  meds.example.yaml
-  tripwire.en.yaml
-  tripwire.uk.yaml
-  affirmatives.en.yaml
-  affirmatives.uk.yaml
-  messages.en.yaml
-  messages.uk.yaml
-scripts/
-  care-tick.sh                    cron entry point
-  install-profile.sh              copies SOUL.md and config fragment into the Hermes profile
-profile/
-  SOUL.md                         agent persona and boundaries, versioned here
-  config-fragment.yaml            telegram group gates, platform_toolsets, skills.external_dirs, safety-gate
-skills/
-  family-care/SKILL.md            agent-side skill: how to call the CLI on every reply
-tests/
-  ...
-```
+| Action | Opens | Closes |
+|---|---:|---:|
+| Daily check-in | configured time | +30 minutes |
+| Dose reminder | configured time | +30 minutes |
+| Check-in nudge | successful check-in +180 minutes | escalation time |
+| Dose nudge | successful reminder +45 minutes | close time |
+| Silence escalation | successful check-in +360 minutes | end of local day |
+| Dose close | successful reminder +120 minutes | first later run |
 
-### 4.1 Code conventions
+The silence-escalation window controls when its outbox action may first be created. Once created, delivery retries may continue beyond the local-day boundary until delivered or explicitly resolved.
 
-Source files carry **no comments**. Every explanation lives in `docs/` or in
-this spec. Names and function boundaries are expected to carry the meaning;
-where they cannot, the file is too clever and should be simplified rather
-than annotated. Docstrings are likewise omitted — module behaviour is
-documented per-module in `docs/`.
+Actions catch up only inside their window. Expired routine prompts are not sent hours late. Failure to deliver a check-in during its window creates a family-facing operational alert because silence cannot be inferred when the parent was never contacted. A dose that was never delivered is a delivery failure, not unconfirmed.
 
-Python 3.12, standard library plus PyYAML. No web framework, no ORM, no
-scheduler library: the scheduler is `hermes cron`, and the store is SQLite
-via `sqlite3`.
+A reminder scheduled inside quiet hours is recorded as `suppressed_quiet` and is not queued for morning. Typed schedule mutation warns before accepting such a schedule.
 
-## 5. The check-in ladder
+## 8. Check-in state machine
 
-### 5.1 Timings
+Default ladder:
 
-Defaults, all overridable in `roster.yaml`:
-
-| Step | Default | Target |
+| Step | Time | Target |
 |---|---|---|
-| check-in | 09:00 local | parent DM |
-| nudge | +3h (12:00) if no reply | parent DM |
-| escalation | +6h (15:00) if still no reply | family group |
+| Check-in | 09:00 local | parent DM |
+| Nudge | successful check-in +180 minutes | parent DM |
+| Silence escalation | successful check-in +360 minutes | family group |
 
-At most one silence escalation per calendar day. After it fires, nudging
-stops for the day — the humans have it now, and a bot continuing to poke the
-parent while a daughter is driving over is noise.
+Rules:
 
-### 5.2 Tick semantics
+1. One check-in episode exists per local day.
+2. It becomes active only after successful delivery.
+3. Only a correlated parent reply received after delivery resolves it.
+4. Nudge failure does not delay escalation.
+5. Silence escalation has one action key and is retried until delivered or explicitly resolved.
+6. Once escalation is queued, routine nudging stops.
+7. A later clear reply creates one stand-down.
+8. A later concerning reply does not create a contradictory stand-down; it creates or updates a concern escalation.
+9. Timely family acknowledgement requires an authenticated reply to the escalation message, or an explicit reference to its id, within 30 minutes. Later acknowledgement is logged but does not claim the timely-response SLA.
 
-`care tick` runs every five minutes and is a pure function of
-`(config, event log, now)`. It computes the set of actions currently **due
-and not already recorded**, executes them, and appends one event per action.
-Running it twice in the same minute produces no duplicate messages; a missed
-window (machine asleep, gateway down) is picked up on the next tick rather
-than lost, provided it is still within the step's validity window.
+## 9. Reply handling
 
-Five-minute granularity means a 09:00 check-in may arrive as late as 09:04.
-This is deliberate: minute-exact delivery would need a per-minute cron with
-no benefit to a human reading a phone.
+### 9.1 Tripwire first
 
-### 5.3 Quiet hours
+Required Ukrainian and English term files support `word`, `prefix`, and `phrase`. Missing files, empty required languages, malformed entries, and unknown modes are fatal configuration errors.
 
-`quiet_hours` (default 21:30–08:00 local) suppresses check-ins, nudges and
-medication reminders. A reminder whose window closes entirely inside quiet
-hours is dropped and recorded as `suppressed_quiet`, never queued to fire at
-07:00 the next morning.
+Tripwire matching precedes affirmative and model processing. A hit records the authenticated update, redacts and bounds the quote, transactionally creates a concern event and outbox row, and returns delivery state as `queued`, `delivered`, or `failed`. Parent or model text cannot cancel it.
 
-**Escalations ignore quiet hours entirely.** A tripwire at 23:40 posts to the
-group at 23:40.
+The parent may be told the system **is trying to notify** the family while queued. It may say the family **has been notified** only after confirmed delivery.
 
-### 5.4 Stand-down
+### 9.2 Additive model judgement
 
-If the parent replies after a silence escalation has been posted, the agent
-posts a stand-down to the group naming the time of the reply and quoting it.
+A non-tripwire reply may be marked `clear` or `unclear` by the model. `unclear` permits one clarifying question. The budget is consumed only when that question is durably queued and sent. A second unresolved reply escalates with redacted quotations of both parent messages.
 
-Acknowledgement by a family member is recorded when someone replies to the
-bot's escalation message, or mentions the bot, within 30 minutes. The agent
-then does not re-raise the same day. It does **not** infer resolution from
-arbitrary chatter — the escalation message asks for exactly the gesture it
-needs: *"reply to this message once someone has reached her."*
+If model or clarification delivery fails, the system records that boundary and does not pretend a question was asked. A configurable timeout escalates an unresolved clarification rather than leaving it open forever.
 
-This choice is forced by how Hermes handles groups, and it is the right one
-anyway. With `require_mention: true` and
-`observe_unmentioned_group_messages: true`, ordinary group chatter is folded
-into the session transcript as context but does **not** dispatch the agent —
-only a reply or a mention does. So a sibling typing "I called her, all fine"
-into the void is visible later but triggers nothing in the moment; a reply to
-the bot triggers the stand-down immediately. Requiring the deliberate gesture
-makes the acknowledgement an explicit act by a named person, recorded with
-their chat id, rather than an inference from whoever happened to type
-something reassuring.
+## 10. Medication reminders
 
-## 6. Reading replies
+`meds.yaml` contains stable ids, label-only descriptions, local times, and optional weekdays. Obvious dosage notation such as number + `mg`, `мг`, `ml`, or `мл` is rejected.
 
-### 6.1 Two layers
-
-**Tripwire — deterministic, unconditional.** A curated term list, normalised
-(case-folded, punctuation-stripped, Cyrillic homoglyphs folded) and matched
-as whole words or phrases. A hit escalates immediately, without model
-involvement, and the escalation message is composed by the CLI. Term lists
-ship per language in `config/tripwire.*.yaml`; **Ukrainian and English** are
-both enabled by default, since the family writes in both.
-
-Seed categories: falls, chest pain, breathlessness, bleeding, confusion or
-disorientation, sudden weakness, explicit calls for help, explicit statements
-of not being okay, statements about having stopped taking medication.
-
-The list is data, not code, and is expected to be edited over time. Terms are
-matched, not interpreted — `care triage` prints the matched term so a false
-positive is traceable to a line in a YAML file.
-
-#### Matching modes, and why Ukrainian needs them
-
-Whole-word matching is wrong for Ukrainian. The language inflects heavily,
-so a single concept has many surface forms: *впала, впав, впали, упала,
-падаю*. Enumerating every form by hand guarantees the one that gets typed at
-04:00 is the one nobody listed.
-
-Each term therefore declares how it matches:
-
-```yaml
-terms:
-  - match: prefix
-    value: "впал"
-    note: fell (feminine, masculine, plural)
-  - match: prefix
-    value: "упал"
-  - match: phrase
-    value: "не можу встати"
-  - match: word
-    value: "кров"
-```
-
-- `prefix` — matches a word starting with the value. Covers inflection with
-  one line. Used for verbs and adjectives.
-- `word` — exact token match. Used where a prefix would over-fire.
-- `phrase` — a normalised token sequence. Used for multi-word idioms such as
-  *не можу дихати*, *болить у грудях*, *викличте швидку*.
-
-`prefix` is chosen over stemming deliberately: a stemmer is a dependency, a
-source of surprises, and untestable by reading. A prefix is auditable by a
-family member who does not write code, which matters because the list is
-meant to be edited by whoever notices a gap.
-
-English keeps `word` and `phrase` and needs no prefixes.
-
-The trade is more false positives, accepted knowingly: a tripwire that fires
-on an innocent message costs one unnecessary group notice, and the family can
-delete the offending line from a YAML file. A tripwire that fails to fire
-costs the thing the agent exists to prevent.
-
-**Soft judgement — model, additive only.** The agent classifies a
-non-tripwire reply as `clear` or `unclear`. `unclear` covers: unusually terse
-relative to that person's norm, vague unwellness, a mention of skipping or
-running out of medication, confusion in phrasing, or a reply that does not
-answer the question asked.
-
-`unclear` buys exactly **one** clarifying question. The question budget is
-enforced by the CLI, not by the model's restraint. The parent's answer is
-re-triaged; if it does not resolve to `clear`, the agent escalates with both
-messages quoted. The agent is never permitted to ask a third time — a parent
-being interrogated by a bot is worse than a family member being called.
-
-### 6.2 Reply handling contract
-
-The agent calls `care reply --text "<verbatim>"` on every parent message and
-obeys the returned directive:
-
-| Verdict | CLI action | Agent action |
+| Step | Time | Target |
 |---|---|---|
-| `clear` | records `reply_received` | warm one- or two-sentence acknowledgement |
-| `tripwire` | records, **escalates to group itself** | tells the parent plainly that the family has been told; asks if they want someone to call; no advice |
-| `unclear` | records, opens question budget of 1 | asks exactly one clarifying question |
-| `unclear` after follow-up | records, escalates to group itself | tells the parent the family has been told |
+| Reminder | configured local time | parent DM |
+| Nudge | successful reminder +45 minutes | parent DM |
+| Close | successful reminder +120 minutes | event only |
 
-The CLI performs tripwire escalation itself rather than instructing the agent
-to do it, so that a model failure between verdict and send cannot swallow the
-escalation.
+Rules:
 
-### 6.3 The non-suppression rule
+1. One episode exists per dose and scheduled local day.
+2. It becomes confirmable only after successful reminder delivery.
+3. Tripwire matching always precedes confirmation.
+4. A direct reply can confirm when it is a conservative affirmative with no negation.
+5. Without reply metadata, auto-confirmation requires exactly one open dose.
+6. `не`, `ні`, `not`, `no`, and configured negative patterns block the fast path. `✅` is matched explicitly.
+7. Unknown/closed doses, unauthorized senders, and ambiguous replies are not confirmed.
+8. Model requests use the same typed authenticated service and cannot invent identity.
+9. Delivered but unconfirmed closes as `unconfirmed`, never `missed`.
+10. Undelivered reminders do not count toward adherence rules.
 
-If the parent asks the agent not to tell the family — after a tripwire, or at
-any point — the agent does not comply, and says so honestly and without
-argument: it explains that it always tells the family about this kind of
-message, that it is telling them now, and that they can talk to the family
-directly. It does not negotiate, moralise, or repeat itself.
+Adherence notification occurs for the same dose unconfirmed on consecutive scheduled days, or two distinct unconfirmed dose episodes in one local day. At most one notice is delivered per rolling 24 hours, and it states that unconfirmed does not mean skipped.
 
-This is the single most important behavioural rule in the system. A
-care-check agent that can be talked out of escalating by the person it is
-checking on provides negative value: the family believes someone is watching,
-and nobody is. It is stated in `SOUL.md` in these terms.
+## 11. Control and consent
 
-## 7. Medication reminders
+Authorization uses trusted sender/chat metadata.
 
-### 7.1 Schedule
-
-`meds.yaml` lists doses, each with a stable `id`, a human `label` used in
-messages, a local time, and an optional day pattern:
-
-```yaml
-doses:
-  - id: morning-bp
-    label: the blood pressure tablet
-    at: "08:30"
-  - id: evening
-    label: the evening tablet
-    at: "20:00"
-    days: [mon, tue, wed, thu, fri, sat, sun]
-```
-
-No dosage amounts are stored or spoken. The agent says "the blood pressure
-tablet", never "50mg". Storing a dose amount invites the agent to discuss it,
-which is outside its boundary, and invites the family to treat the bot's copy
-as authoritative over the pharmacy label.
-
-### 7.2 Dose ladder
-
-| Step | Default | Target |
-|---|---|---|
-| reminder | at dose time | parent DM |
-| nudge | +45m if unconfirmed | parent DM |
-| close as unconfirmed | +2h | recorded only, nothing sent |
-
-Confirmation is recorded by `care confirm --dose <id>`, called either by the
-agent when the parent says they took it, or by a deterministic fast path: a
-bare affirmative (`так`, `добре`, `гаразд`, `випила`, `прийняла`, `готово`,
-`yes`, `done`, `✅` and similar, per the language lists) received inside an
-open dose window confirms without the model.
-
-Affirmatives live in `config/affirmatives.uk.yaml` and
-`config/affirmatives.en.yaml` and use the same matching modes as the tripwire
-lists, so the Ukrainian gendered verb forms (*випила* / *випив*, *прийняла* /
-*прийняв*) are one `prefix` entry each rather than four `word` entries.
-
-Tripwire matching runs **before** the affirmative fast path. A message that
-hits both — *"так, випила, але дуже болить голова"* — escalates; it does not
-quietly close the dose and stop there.
-
-### 7.3 Unconfirmed is not missed
-
-A closed dose is recorded as `unconfirmed`, never as `missed`. Most
-unconfirmed doses are a parent who took the pill and put the phone down. The
-distinction is carried into the group message wording, which says so
-explicitly.
-
-Adherence escalation fires when either:
-
-- the same dose is unconfirmed on two consecutive days, or
-- two doses are unconfirmed within one calendar day
-
-At most one adherence escalation per rolling 24 hours. It is phrased as
-information, not accusation, and it asks the family to check rather than
-asserting that medication was skipped.
-
-## 8. Control surface and consent
-
-### 8.1 Who may change what
-
-Authorisation is by Telegram chat id, from `roster.yaml`.
-
-| Actor | May do |
+| Actor | Allowed actions |
 |---|---|
-| family members (group) | set check-in and dose times, add/edit/remove doses, pause, resume, stop, `status` |
-| parent (DM) | snooze a single reminder, skip a single day, request full stop |
-| anyone else | nothing; the CLI refuses and the attempt is recorded |
+| Parent in configured DM | snooze one open reminder, skip today, stop |
+| Configured family member in configured group | pause, resume, stop, skip today, set check-in time, add/edit/remove label-only doses, status, acknowledge |
+| Anyone else | none; refusal is recorded |
 
-Every mutation prints a confirmation line that the agent posts **verbatim**
-to the family group. Schedule changes are never made quietly: a family where
-one sibling can silently move a reminder is a family that will later disagree
-about what the bot was supposed to do.
+Base YAML seeds a versioned configuration snapshot when a state database is initialized. Runtime mutations are typed append-only events layered over that snapshot. The model never edits YAML. Later operator edits to the seed files are not adopted silently: `doctor` reports the fingerprint mismatch and an explicit validated import/reconciliation is required. Effective configuration therefore replays from the stored snapshot plus mutation events with attributable, atomic history.
 
-### 8.2 Pause, skip, stop
+- **Snooze:** moves one open routine reminder within the same local day; never an escalation or into quiet hours.
+- **Skip today:** suppresses remaining routine prompts and announces the change.
+- **Pause:** suppresses routine episodes until resumed or through an inclusive date; queued escalations remain active.
+- **Stop:** prevents new routine episodes immediately. The family notice enters the outbox in the same transaction. Only family can resume.
+- **Schedule mutation:** validates typed before/after values and commits the event plus announcement atomically.
 
-- **snooze** — one reminder, moved by a stated interval within the same day.
-- **skip today** — suppresses remaining check-in and reminders for the
-  calendar day. The silence ladder does not run. The group is told.
-- **stop** — the parent may stop the agent entirely. The CLI honours it
-  immediately and posts a plain notice to the group: the agent has been
-  stopped at the parent's request and is no longer checking in. Only a family
-  member can resume.
+The deterministic outbox is the only sender of announcements; the model does not repost them.
 
-Honoured-but-announced is the whole of the consent design. A daily message
-the parent cannot escape is surveillance; an agent that can go dark without
-the family noticing is a false sense of safety. Announcing the stop is what
-makes both false.
+## 12. Persistence and privacy
 
-## 9. Data model
+SQLite contains:
 
-One SQLite database, one append-only table.
-
-```sql
-events(
-  id        INTEGER PRIMARY KEY,
-  ts_utc    TEXT NOT NULL,
-  local_day TEXT NOT NULL,
-  kind      TEXT NOT NULL,
-  subject   TEXT,
-  payload   TEXT
-)
+```text
+incoming_updates(update_id UNIQUE, chat_id, sender_id, message_id,
+                 reply_to_message_id, received_at_utc, result)
+events(id, ts_utc, local_day, kind, episode_id, subject, actor_id,
+       source_update_id, payload)
+outbox(id, action_key UNIQUE, priority, chat_id, text, status, attempts,
+       available_at_utc, lease_until_utc, last_error, receipt_id)
 ```
 
-Event kinds: `checkin_sent`, `checkin_nudged`, `reply_received`,
-`clarify_asked`, `escalated_silence`, `escalated_concern`, `stood_down`,
-`escalation_acknowledged`, `dose_reminded`, `dose_nudged`, `dose_confirmed`,
-`dose_unconfirmed`, `escalated_adherence`, `suppressed_quiet`, `snoozed`,
-`skipped_day`, `paused`, `resumed`, `stopped`, `schedule_changed`,
-`unauthorised_attempt`.
+Events are append-only; outbox delivery state is mutable. SQLite uses WAL, busy timeout, foreign keys, and `BEGIN IMMEDIATE` for claims/transitions. The directory is user-only (`0700`) and database `0600`.
 
-Day state is **derived** by folding the event log, never stored. There is one
-source of truth, history is replayable, and any dispute about what the agent
-did is answered by `care log --day 2026-09-12`. `local_day` is denormalised
-onto each row so that day-boundary queries do not depend on timezone maths at
-read time.
+Care persists only redacted, bounded excerpts. Default retention for excerpts and completed outbox bodies is 30 days; structural events and delivery metadata remain until operator purge. `care purge` applies policy. Backups inherit the same access restrictions; disk encryption is an operator concern.
 
-Location: outside the repository, default
-`~/.hermes/profiles/telegram-family-assistant/workspace/care-state.db`,
-overridable by `CARE_STATE_DB`.
+Redaction occurs before event payloads, model directives, logs, and family messages, replacing dosage-like number/unit combinations with `[redacted dosage]`. Telegram/Hermes may still possess the original transport message; operations documentation must state that external boundary.
 
-## 10. Delivery
+## 13. Durable delivery and idempotency
 
-`care` never calls the Telegram API. It shells out to
-`hermes send --to telegram:<chat_id>`, reusing the gateway's credentials, so
-there is one place where bot tokens live and the tick works whether or not
-the gateway process is running.
+Policy transitions and outbox inserts occur in one transaction with a unique logical action key. A worker claims an eligible row with a lease, sends outside the transaction, then records success/failure.
 
-Every deterministic message is a template in `config/messages.<lang>.yaml`,
-not a string in a `.py` file. `roster.yaml` picks the catalogue with
-`message_language` (default `uk`). Keeping the text as data means the family
-can reword what the parent reads without touching code, the wording is
-reviewable by someone who does not program, and `docs/message-catalogue.md`
-can quote it verbatim. Model-composed DMs are unaffected — the catalogue
-covers only what the CLI sends on its own.
+This prevents overlapping workers from sending the same unclaimed action. A crash after Telegram accepts a send but before receipt storage can still duplicate. If Hermes supports idempotency keys, the adapter uses the action key. Otherwise escalation delivery is explicitly **at least once**: duplicates are preferable to silent loss. `doctor` and family documentation expose this limitation.
 
-Three delivery modes:
+Transport requirements:
 
-- `live` — sends.
-- `dry-run` — prints what would be sent, with target and text. Default in
-  tests and during initial setup.
-- `capture` — in-process list, used by the test suite.
+- bounded timeout;
+- safe arguments/stdin with no shell interpolation;
+- typed exception/error capture;
+- bounded Telegram message size and safe markup behavior;
+- receipt/message id capture when available;
+- exponential retry with bounded maximum interval;
+- escalation and stop-notice priority;
+- permanent failures visible and causing non-zero `doctor` status.
 
-A send failure is recorded as an event with the error, and retried on the
-next tick while the step's window is still open. A failed escalation is
-retried on every tick until it succeeds or the day ends, and a
-never-delivered escalation is surfaced by `care doctor`.
+Dry-run uses an in-memory or explicit separate database and never completes operational outbox rows.
 
-## 11. Cron
+## 14. Messages
 
-One job:
+Deterministic text remains in `config/messages.<lang>.yaml`. Required catalogues define identical validated keys. Values are redacted and bounded before rendering.
 
-```
-hermes cron create --name family-care-tick "*/5 * * * *" \
-  --script care-tick.sh --no-agent
+Wording distinguishes `queued`, `delivered`, and `failed/pending`. No message claims unconfirmed means missed, includes configured dosage amounts, gives medical advice, or claims delivery without evidence.
+
+## 15. Commands and integration contracts
+
+Operator CLI:
+
+```text
+care run                 derive due actions and attempt delivery
+care tick                derive/enqueue only
+care deliver             deliver eligible outbox rows
+care status              read-only projection
+care log --day DATE      redacted history
+care doctor              config, adapter, outbox, cron and permission checks
+care triage --text-stdin local test, no persistence
+care purge               apply retention policy
+care config-import       validate and explicitly adopt changed seed config
 ```
 
-`--no-agent` is load-bearing: the script is the job, no model is invoked, and
-empty stdout means silence. `care tick` prints nothing on an uneventful tick,
-so the classic watchdog pattern applies and the profile is not spammed.
+Authenticated adapter operations are typed service/tool calls, not shell strings:
 
-## 12. Agent integration
+```text
+ingest(envelope)
+acknowledge(envelope, escalation_id)
+snooze(envelope, episode_id, minutes)
+skip_today(envelope)
+stop(envelope)
+pause(envelope, until)
+resume(envelope)
+set_checkin_time(envelope, hhmm)
+add_or_update_dose(envelope, dose fields)
+remove_dose(envelope, dose_id)
+submit_model_judgement(update_id, clear|unclear)
+submit_clarifying_question(update_id, text)
+```
 
-`skills/family-care/SKILL.md` is registered through
-`skills.external_dirs` in the profile config, matching how the `medassist`
-profile consumes `/root/hermes-medical-assistant/skills`. It instructs the
-agent to call `care reply` on every parent DM before composing anything, to
-obey the returned directive exactly, to post CLI confirmation lines verbatim,
-and never to describe an escalation as done unless the tool reported success.
+Diagnostic message bodies enter through stdin/JSON stdin. Trusted actor fields remain adapter-only. Telegram text is never interpolated into shell commands.
 
-`profile/SOUL.md` replaces the profile's stock Hermes boilerplate. It carries
-the boundaries from §1, the non-suppression rule from §6.3, and a tone
-section: short sentences, one question per message, plain words, no emoji
-storm, never guilt about a missed dose, never claim to have contacted anyone
-the tools did not actually reach.
+## 16. Configuration validation
 
-## 13. Testing
+Startup rejects unknown timezones; invalid times, dates, weekdays, windows, and ladder ordering; duplicate/conflicting identities or dose ids; missing roster identities; unsupported delivery mode; missing/empty/malformed term lists; unknown match modes; missing/mismatched message catalogues; dosage-like labels; check-ins wholly inside quiet hours; and insecure/unwritable live state paths.
 
-Everything deterministic is tested without network, model, or wall clock:
-`FixedClock`, an in-memory SQLite event log, and `capture` delivery.
+Environment overrides such as `CARE_STATE_DB` are either implemented and tested or omitted from documentation. No fallback silently changes safety behavior.
 
-Scenario tests, each asserting the exact sequence of sends:
+## 17. Testing and acceptance
 
-1. happy path — check-in, reply, acknowledgement, no group traffic
-2. silence — check-in, nudge at +3h, escalation at +6h, nothing after
-3. late reply — escalation fired, reply at +7h, stand-down posted
-4. tripwire at 23:40 — immediate escalation despite quiet hours
-5. unclear then clear — one clarifying question, no escalation
-6. unclear then still unclear — escalation quoting both messages
-7. parent asks the agent not to tell — escalation still posted
-8. dose confirmed by bare affirmative — no model involved
-8b. Ukrainian inflection — `впала`, `впав`, `упали` all trip one `prefix` term
-8c. affirmative plus tripwire in one message — escalates, does not just confirm
-9. dose unconfirmed two days running — one adherence escalation, not two
-10. two doses unconfirmed in one day — one adherence escalation
-11. quiet hours — evening dose after 21:30 dropped, recorded as suppressed
-12. skip today — no check-in, no ladder, group told
-13. stop by parent — group notice, subsequent ticks silent, family resume works
-14. unauthorised chat id attempts a schedule change — refused and recorded
-15. idempotency — the same tick run three times sends once
-16. missed window — machine asleep across 09:00, tick at 09:20 still sends
-17. delivery failure — escalation retried next tick, then succeeds
-18. DST boundary — local times hold across the transition
+Deterministic tests use a fixed clock, temporary SQLite, fake transport, and authenticated envelopes. They cover:
 
-## 14. Prerequisites and open items
+- happy check-in, silence, late clear reply, and late concerning reply;
+- night tripwire and non-suppression requests;
+- clarify success, failure, timeout, and second unresolved reply;
+- correlated affirmative, emoji, negation, ambiguity, closed/unknown dose;
+- adherence using only delivered reminders;
+- pause, snooze, skip, stop, resume, and typed schedule changes;
+- unauthorized actors and forged actor text;
+- replayed updates, concurrent ticks/workers, and SQLite contention;
+- crashes before send, after accepted send, and before receipt write;
+- timeout, missing transport, permanent failure, and recovery;
+- dry-run isolation;
+- size, redaction, shell-metacharacter, and multiline cases;
+- catch-up expiry, quiet hours, local-day, spring-forward, and fall-back;
+- missing safety files and malformed/insecure config;
+- acknowledgement correlation and 30-minute classification.
 
-1. **The family group is not registered.** `channel_directory.json` currently
-   knows only two DMs: Tëma (`11111111`) and Dima K (`22222222`). The bot
-   must be added to the group and one message sent there before Hermes learns
-   the chat id. Until then `roster.yaml` cannot be completed.
-2. **Group message delivery** must be opened up — either BotFather privacy
-   mode off, or the bot promoted to group admin — for the stand-down
-   acknowledgement (§5.4) and the group control surface (§8), plus the
-   matching `telegram.group_allowed_chats` / `require_mention` /
-   `observe_unmentioned_group_messages` settings in the profile config.
-   Without it the system still works, minus those two behaviours. Step by
-   step in `docs/operations.md`; `care doctor` reports which mode is in
-   effect and warns when the config and the Telegram side disagree.
-3. **There is no parent in the directory.** Development and acceptance use a
-   stand-in DM plus `dry-run`, so no real check-ins go out before the roster
-   is real.
-4. **Timezone** defaults to the host's `Europe/Berlin`. The parent's actual
-   timezone goes in `roster.yaml` and is the only one that governs schedule
-   times.
-5. **Model.** The profile currently runs `openai/gpt-5.6-terra` via
-   OpenRouter. Nothing in the design depends on the model choice, because
-   nothing safety-critical is delegated to it.
+Scenario tests use isolated configurations and assert action/event kinds rather than broad message counts that mix check-ins and medication reminders.
 
-## 15. What is deliberately not built
+Live acceptance requires a staging profile and stand-in parent. Real Hermes metadata, privacy behavior, send receipts, cron overlap behavior, and a full-day ladder are verified before configuring the real parent.
 
-- No health advice, symptom checking, or triage of any kind.
-- No daily "all fine" digest to the group — it would train the family to
-  ignore the channel where escalations arrive.
-- No voice calls, SMS, or non-Telegram fallback.
-- No multi-parent support. One parent, one group. The data model would allow
-  more; the messages and the ladder assume one, and pretending otherwise
-  would ship an untested path.
-- No dosage amounts, prescriptions, or medical record storage.
-- No web dashboard. `care status` and `care log` are the interface.
+## 18. Operations and failure policy
+
+`care doctor` reports configuration/catalogue validity, state permissions, adapter version/contract, observable cron health, outbox state by category, undelivered escalations and stop notices, transport idempotency support, and retention status.
+
+Outages catch up only inside defined windows. Failed safety messages remain pending and are never shown as successful. State database loss is a visible operational event, not an invisible clean start.
+
+## 19. Deployment gates
+
+1. Register the real family supergroup and parent/family ids.
+2. Configure Telegram privacy/admin behavior and Hermes allowlists.
+3. Verify a pre-model hook with immutable sender/update metadata.
+4. Verify safe send input, timeout, text limits, and receipt/message id.
+5. Determine transport idempotency support.
+6. Validate exact profile and cron syntax against installed Hermes.
+7. Obtain parent/family agreement on schedule, non-suppression, retention, and non-emergency scope.
+8. Complete dry-run and stand-in staging acceptance.
+
+Until gates 3 and 4 are proven, integration is `NOT_RUN` and live deployment is a no-go.
+
+## 20. Deliberately not built
+
+- Health advice, symptom interpretation, clinical triage, or emergency dispatch.
+- Daily all-fine group digests.
+- Voice, SMS, or a second transport.
+- Multi-parent behavior.
+- Dosage, prescription, laboratory, or medical-record storage.
+- Arbitrary terminal access for the conversational agent.
+- A web dashboard.
+- Exact-once Telegram claims when the transport cannot prove them.

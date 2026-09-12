@@ -1,3 +1,5 @@
+import logging
+import re
 import subprocess
 import threading
 from datetime import datetime, timedelta, timezone
@@ -13,11 +15,17 @@ from care.delivery import (
     DeliveryWorker,
     FailureInjectionTransport,
     HermesSendTransport,
+    _neutralise_markup,
     permanent_error_result,
     retryable_error_result,
     timeout_result,
 )
 from care.store import MAX_OUTBOX_TEXT_LENGTH, Store
+
+
+def _strip_markup_neutralisation(sent: str) -> str:
+    without_zwsp = sent.replace("​", "")
+    return re.sub(r"\\(.)", r"\1", without_zwsp)
 
 UTC = timezone.utc
 T0 = datetime(2026, 9, 12, 9, 0, tzinfo=UTC)
@@ -260,7 +268,7 @@ def test_worker_treats_lease_lost_on_mark_retry_and_mark_failed_as_benign(db_pat
     worker = DeliveryWorker(store=store, transport=transport, clock=FixedClock(T0))
 
     retry_outcome = worker._finish_retry("a", error="late", attempts=1)
-    failed_outcome = worker._finish_failed("b", error="late")
+    failed_outcome = worker._finish_failed("b", target="1", error="late")
 
     assert retry_outcome.outcome == "lease_lost"
     assert failed_outcome.outcome == "lease_lost"
@@ -463,6 +471,73 @@ def test_hermes_transport_never_uses_shell_with_hostile_text():
 
     assert result.status == "delivered"
     assert calls == [hostile]
+
+
+def test_hermes_transport_unicode_decode_error_is_retryable():
+    def fake_run(argv, **kwargs):
+        raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+
+    transport = HermesSendTransport(profile="p", run=fake_run)
+    result = transport.send(target="1", text="x", idempotency_key="k")
+
+    assert result.status == "failed"
+    assert result.retryable is True
+
+
+def test_neutralise_markup_round_trips_parent_verbatim_text():
+    raw = "-no reply since 09:00. Please call *now* and check `status_flag` (urgent) [ref] !"
+
+    escaped = _neutralise_markup(raw)
+
+    assert escaped != raw
+    for ch in "_*[]()~`>#+-=|{}.!\\":
+        if ch in raw:
+            assert f"\\{ch}" in escaped
+    assert _strip_markup_neutralisation(escaped) == raw
+
+
+def test_neutralise_markup_defeats_hermes_html_autodetection():
+    raw = "check this <b>bold</b> tag"
+
+    escaped = _neutralise_markup(raw)
+
+    assert re.search(r"<[a-zA-Z/][^>]*>", escaped) is None
+    assert _strip_markup_neutralisation(escaped) == raw
+
+
+def test_outgoing_text_is_neutralised_before_reaching_transport(db_path):
+    store = Store.open(db_path)
+    hostile = "-no reply since 09:00. Please call *now* and check `status_flag` (urgent) [ref] <b>!"
+    _enqueue(store, action_key="a", text=hostile, priority=PRIORITY_ESCALATION)
+    transport = CaptureTransport()
+    worker = DeliveryWorker(store=store, transport=transport, clock=FixedClock(T0))
+
+    worker.run_once()
+
+    sent = transport.calls[0].text
+    assert sent != hostile
+    assert re.search(r"<[a-zA-Z/][^>]*>", sent) is None
+    assert _strip_markup_neutralisation(sent) == hostile
+    store.close()
+
+
+def test_permanent_failure_logs_error_with_action_key_target_and_error(db_path, caplog):
+    store = Store.open(db_path)
+    _enqueue(store, action_key="a", chat_id="555")
+    transport = FailureInjectionTransport([permanent_error_result("Chat not found")])
+    worker = DeliveryWorker(store=store, transport=transport, clock=FixedClock(T0))
+
+    with caplog.at_level(logging.ERROR, logger="care.delivery"):
+        outcomes = worker.run_once()
+
+    assert outcomes[0].outcome == "failed"
+    error_records = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert len(error_records) == 1
+    message = error_records[0].getMessage()
+    assert "a" in message
+    assert "555" in message
+    assert "Chat not found" in message
+    store.close()
 
 
 def test_dry_run_delivery_mode_never_opens_operational_store(tmp_path):

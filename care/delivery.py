@@ -46,6 +46,13 @@ _TRANSIENT_MARKERS = (
 
 _logger = logging.getLogger("care.delivery")
 
+_MARKDOWNV2_ESCAPE_CHARS = set("\\_*[]()~`>#+-=|{}.!")
+
+
+def _neutralise_markup(text: str) -> str:
+    guarded = text.replace("<", "<​")
+    return "".join(f"\\{ch}" if ch in _MARKDOWNV2_ESCAPE_CHARS else ch for ch in guarded)
+
 
 @dataclass(frozen=True)
 class DeliveryResult:
@@ -145,6 +152,8 @@ class HermesSendTransport(Transport):
             return retryable_error_result(f"hermes binary not found: {exc}")
         except OSError as exc:
             return retryable_error_result(f"hermes send subprocess error: {exc}")
+        except UnicodeDecodeError as exc:
+            return retryable_error_result(f"hermes send produced undecodable output: {exc}")
 
         if proc.returncode == 0:
             try:
@@ -225,6 +234,7 @@ class DeliveryWorker:
         if len(row.text) > MAX_OUTBOX_TEXT_LENGTH:
             return self._finish_failed(
                 row.action_key,
+                target=row.chat_id,
                 error=(
                     f"outbox text length {len(row.text)} exceeds the maximum transportable "
                     f"length {MAX_OUTBOX_TEXT_LENGTH}; refusing to truncate"
@@ -232,7 +242,7 @@ class DeliveryWorker:
             )
 
         result = self._transport.send(
-            target=row.chat_id, text=row.text, idempotency_key=row.action_key
+            target=row.chat_id, text=_neutralise_markup(row.text), idempotency_key=row.action_key
         )
 
         if result.status == STATUS_DELIVERED:
@@ -242,7 +252,7 @@ class DeliveryWorker:
         if result.retryable and row.attempts < self._max_attempts:
             return self._finish_retry(row.action_key, error=error, attempts=row.attempts)
 
-        return self._finish_failed(row.action_key, error=error)
+        return self._finish_failed(row.action_key, target=row.chat_id, error=error)
 
     def _finish_delivered(self, action_key: str, *, receipt_id: str | None) -> DeliveryAttemptOutcome:
         try:
@@ -269,10 +279,16 @@ class DeliveryWorker:
             return DeliveryAttemptOutcome(action_key=action_key, outcome=OUTCOME_LEASE_LOST)
         return DeliveryAttemptOutcome(action_key=action_key, outcome=OUTCOME_RETRYING, error=error)
 
-    def _finish_failed(self, action_key: str, *, error: str) -> DeliveryAttemptOutcome:
+    def _finish_failed(self, action_key: str, *, target: str, error: str) -> DeliveryAttemptOutcome:
         try:
             self._store.mark_failed(action_key, error=error, now_utc=self._clock.now_utc())
         except LeaseLostError:
             _logger.info("lease already resolved by another worker: %s", action_key)
             return DeliveryAttemptOutcome(action_key=action_key, outcome=OUTCOME_LEASE_LOST)
+        _logger.error(
+            "permanent delivery failure: action_key=%s target=%s error=%s",
+            action_key,
+            target,
+            error,
+        )
         return DeliveryAttemptOutcome(action_key=action_key, outcome=OUTCOME_FAILED, error=error)

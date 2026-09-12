@@ -37,6 +37,55 @@ Three transports exist:
   The `run` callable is injectable so tests can fake `subprocess.run`
   without ever invoking a real `hermes` binary.
 
+## Outgoing text is neutralised before it reaches Hermes
+
+`hermes send` has no plain-text delivery path. The installed adapter
+(`send_message_tool.py`, `_send_telegram`) always applies a parse mode to
+whatever text it is given:
+
+- if the text matches `<[a-zA-Z/][^>]*>` it is sent with `parse_mode=HTML`;
+- otherwise it is run through the gateway's markdown-to-MarkdownV2
+  converter and sent with `parse_mode=MARKDOWN_V2`. If that conversion
+  raises, the *original, unescaped* text is sent anyway, still under
+  `MARKDOWN_V2`.
+
+There is no flag to disable either behaviour. Our escalations and
+check-in messages embed a verbatim quote of whatever the parent typed,
+and MarkdownV2 gives special meaning to `_ * [ ] ( ) ~ \` > # + - = | { }
+. !` (and to a literal backslash). An ordinary reply containing a full
+stop, a bracket, or a dash is completely normal parent input, and left
+unescaped it can make Telegram reject the send with a 400 — meaning the
+message that fails to send is the escalation itself, so the family is
+never told. Untouched `<...>`-shaped text can also be silently
+reinterpreted as HTML instead of being shown literally.
+
+`DeliveryWorker._process` calls `care.delivery._neutralise_markup` on
+`row.text` before it is ever handed to `Transport.send`, so this holds
+for every transport, not just `HermesSendTransport`:
+
+1. Every occurrence of `<` gets a zero-width space (`​`) inserted
+   immediately after it. This is invisible when rendered, but it means
+   the text can never match Hermes's `<[a-zA-Z/][^>]*>` autodetection
+   regex, so Hermes always takes the MarkdownV2 path — never the HTML
+   one — regardless of what the parent typed.
+2. Every MarkdownV2-reserved character, and a literal backslash, is
+   escaped with a preceding backslash. Because this operates on the
+   original character stream (not a re-scan of its own output), it
+   cannot double-escape the backslashes it just inserted.
+
+The net effect: whatever parse mode Hermes ends up using, the family
+sees exactly the characters the parent typed (up to an invisible
+zero-width space), and the payload we send Hermes is never invalid
+MarkdownV2 that could cause Telegram to reject the whole send.
+
+This escaping can inflate the length of `text` (each escaped character
+becomes two). `MAX_OUTBOX_TEXT_LENGTH` enforcement happens on the raw,
+pre-escaping length, so a message sitting very close to the 4096 cap
+with heavy special-character density could still be rejected downstream
+by Telegram after escaping; no code path in this codebase currently
+produces text anywhere near that dense, so it is a known, narrow edge
+rather than something actively guarded against here.
+
 ## Idempotency key: accepted, not usable
 
 `idempotency_key` is part of the `Transport.send` signature so the
@@ -89,11 +138,18 @@ assumption.
   failure. Defaults: `max_attempts=6`, `base_backoff_seconds=30`,
   `max_backoff_seconds=1800` (30 minutes).
 - `HermesSendTransport` classifies its own failures: a network timeout or
-  missing binary is `retryable=True`; an exit-2 usage error is always
-  `retryable=False` (it is our own invocation bug, retrying changes
-  nothing); an exit-1 backend error is `retryable=True` only if its message
-  contains a transient marker (rate limit/429/5xx/timeout wording),
-  otherwise it is treated as permanent (e.g. "Chat not found").
+  missing binary is `retryable=True`; a `UnicodeDecodeError` while reading
+  the subprocess's output (a `ValueError`, not an `OSError`, so it needs
+  its own `except` clause) is also `retryable=True`; an exit-2 usage error
+  is always `retryable=False` (it is our own invocation bug, retrying
+  changes nothing); an exit-1 backend error is `retryable=True` only if its
+  message contains a transient marker (rate limit/429/5xx/timeout
+  wording), otherwise it is treated as permanent (e.g. "Chat not found").
+- A permanent failure (`_finish_failed` succeeding, i.e. not a benign
+  `LeaseLostError`) is logged at `logging.ERROR` with the action key,
+  target chat id, and error string, so it is visible in process logs even
+  before `care doctor` (a later task) can surface it as a first-class
+  operator signal.
 
 ## Priority
 

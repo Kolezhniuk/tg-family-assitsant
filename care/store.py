@@ -92,6 +92,10 @@ class LeaseLostError(Exception):
     pass
 
 
+class UnknownActionKeyError(LeaseLostError):
+    pass
+
+
 def _iso(value: datetime) -> str:
     if value.tzinfo is None:
         raise ValueError("naive datetimes are not accepted; pass a timezone-aware UTC datetime")
@@ -116,6 +120,15 @@ def _check_bounded_payload(value) -> None:
     elif isinstance(value, (list, tuple)):
         for item in value:
             _check_bounded_payload(item)
+
+
+def _check_bounded_text_column(value: str | None, column: str) -> None:
+    if value is None:
+        return
+    if len(value) > MAX_EXCERPT_LENGTH:
+        raise ValueError(f"event {column} exceeds bounded excerpt length")
+    if contains_dosage_notation(value):
+        raise ValueError(f"event {column} contains unredacted dosage notation")
 
 
 def ensure_secure_state_path(db_path: Path) -> None:
@@ -230,6 +243,8 @@ class WriteTxn:
             raise ValueError("event kind must not be empty")
         if episode_id is not None:
             validate_episode_id(episode_id)
+        _check_bounded_text_column(subject, "subject")
+        _check_bounded_text_column(actor_id, "actor_id")
         _check_bounded_payload(payload)
         cursor = self._conn.execute(
             "INSERT INTO events"
@@ -333,7 +348,9 @@ class Store:
         self._conn = connection
 
     @classmethod
-    def open(cls, db_path: Path | str) -> "Store":
+    def open(cls, db_path: Path | str, *, delivery_mode: str | None = None) -> "Store":
+        if delivery_mode == "dry-run":
+            raise RuntimeError("dry-run delivery mode must not open the operational database")
         is_memory = str(db_path) == ":memory:"
         if not is_memory:
             db_path = Path(db_path)
@@ -460,6 +477,14 @@ class Store:
             self._safe_rollback()
             raise
 
+    def _raise_lease_lost(self, action_key: str, *, action: str) -> None:
+        row = self._conn.execute(
+            "SELECT 1 FROM outbox WHERE action_key = ?", (action_key,)
+        ).fetchone()
+        if row is None:
+            raise UnknownActionKeyError(f"{action_key}: no outbox row with this action key; cannot {action}")
+        raise LeaseLostError(f"{action_key}: not currently in_flight; cannot {action}")
+
     def mark_delivered(self, action_key: str, *, receipt_id: str, delivered_at_utc: datetime) -> None:
         cursor = self._conn.execute(
             "UPDATE outbox SET status = 'delivered', receipt_id = ?, last_error = NULL,"
@@ -468,7 +493,7 @@ class Store:
             (receipt_id, _iso(delivered_at_utc), action_key),
         )
         if cursor.rowcount != 1:
-            raise LeaseLostError(f"{action_key}: not currently in_flight; cannot mark delivered")
+            self._raise_lease_lost(action_key, action="mark delivered")
 
     def mark_retry(
         self, action_key: str, *, error: str, available_at_utc: datetime, now_utc: datetime
@@ -480,7 +505,7 @@ class Store:
             (error, _iso(available_at_utc), _iso(now_utc), action_key),
         )
         if cursor.rowcount != 1:
-            raise LeaseLostError(f"{action_key}: not currently in_flight; cannot mark retrying")
+            self._raise_lease_lost(action_key, action="mark retrying")
 
     def mark_failed(self, action_key: str, *, error: str, now_utc: datetime) -> None:
         cursor = self._conn.execute(
@@ -490,7 +515,7 @@ class Store:
             (error, _iso(now_utc), action_key),
         )
         if cursor.rowcount != 1:
-            raise LeaseLostError(f"{action_key}: not currently in_flight; cannot mark failed")
+            self._raise_lease_lost(action_key, action="mark failed")
 
     def get_outbox_by_action_key(self, action_key: str) -> OutboxRow | None:
         row = self._conn.execute("SELECT * FROM outbox WHERE action_key = ?", (action_key,)).fetchone()
@@ -504,6 +529,15 @@ class Store:
                 "SELECT * FROM events WHERE episode_id = ? ORDER BY id ASC", (episode_id,)
             ).fetchall()
         return [_row_to_event(row) for row in rows]
+
+    def list_outbox(self, *, episode_id: str | None = None) -> list[OutboxRow]:
+        if episode_id is None:
+            rows = self._conn.execute("SELECT * FROM outbox ORDER BY id ASC").fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT * FROM outbox WHERE episode_id = ? ORDER BY id ASC", (episode_id,)
+            ).fetchall()
+        return [_row_to_outbox(row) for row in rows]
 
     def current_config_snapshot(self) -> ConfigSnapshot | None:
         row = self._conn.execute(
@@ -560,6 +594,7 @@ class Store:
         self, files: Mapping[str, Path], *, stored_at_utc: datetime, actor_id: str | None = None
     ) -> ConfigSnapshot:
         fingerprint, entries, contents = _compute_fingerprint(files)
+        _check_bounded_text_column(actor_id, "actor_id")
         payload = json.dumps(
             {
                 "files": [{"name": e.name, "sha256": e.sha256} for e in entries],
@@ -606,6 +641,4 @@ class Store:
 
 
 def open_store(db_path: Path, *, delivery_mode: str) -> Store:
-    if delivery_mode == "dry-run":
-        raise RuntimeError("dry-run delivery mode must not open the operational database")
-    return Store.open(db_path)
+    return Store.open(db_path, delivery_mode=delivery_mode)

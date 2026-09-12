@@ -23,6 +23,7 @@ from care.store import (
     ConfigSnapshotDriftError,
     LeaseLostError,
     Store,
+    UnknownActionKeyError,
     ensure_secure_state_path,
     open_store,
 )
@@ -529,3 +530,142 @@ def test_two_workers_cannot_claim_the_same_outbox_row(db_path):
 
     assert not errors
     assert sorted(claimed_counts) == [0, 1]
+
+
+def test_list_outbox_filters_by_episode_id(db_path):
+    store = Store.open(db_path)
+    checkin_episode = checkin_episode_id(date(2026, 9, 12))
+    dose_episode = dose_episode_id("morning-pills", date(2026, 9, 12))
+    with store.transaction() as txn:
+        txn.enqueue_outbox(
+            action_key=make_action_key(checkin_episode, "prompt"),
+            chat_id="1",
+            text="checkin prompt",
+            priority=0,
+            available_at_utc=datetime(2026, 9, 12, 9, 0, tzinfo=UTC),
+            created_at_utc=datetime(2026, 9, 12, 9, 0, tzinfo=UTC),
+            episode_id=checkin_episode,
+        )
+        txn.enqueue_outbox(
+            action_key=make_action_key(dose_episode, "prompt"),
+            chat_id="1",
+            text="dose prompt",
+            priority=0,
+            available_at_utc=datetime(2026, 9, 12, 9, 0, tzinfo=UTC),
+            created_at_utc=datetime(2026, 9, 12, 9, 0, tzinfo=UTC),
+            episode_id=dose_episode,
+        )
+        txn.enqueue_outbox(
+            action_key="no-episode",
+            chat_id="1",
+            text="untied",
+            priority=0,
+            available_at_utc=datetime(2026, 9, 12, 9, 0, tzinfo=UTC),
+            created_at_utc=datetime(2026, 9, 12, 9, 0, tzinfo=UTC),
+        )
+
+    checkin_rows = store.list_outbox(episode_id=checkin_episode)
+    assert [row.action_key for row in checkin_rows] == [make_action_key(checkin_episode, "prompt")]
+
+    dose_rows = store.list_outbox(episode_id=dose_episode)
+    assert [row.action_key for row in dose_rows] == [make_action_key(dose_episode, "prompt")]
+
+    all_rows = store.list_outbox()
+    assert len(all_rows) == 3
+
+    other_episode_rows = store.list_outbox(episode_id=clarify_episode_id(999))
+    assert other_episode_rows == []
+    store.close()
+
+
+def test_append_event_rejects_overlong_subject_and_actor_id(db_path):
+    store = Store.open(db_path)
+    with store.transaction() as txn, pytest.raises(ValueError):
+        txn.append_event(
+            ts_utc=datetime(2026, 9, 12, 9, 0, tzinfo=UTC),
+            local_day=date(2026, 9, 12),
+            kind="k",
+            payload={},
+            subject="x" * 300,
+        )
+    with store.transaction() as txn, pytest.raises(ValueError):
+        txn.append_event(
+            ts_utc=datetime(2026, 9, 12, 9, 0, tzinfo=UTC),
+            local_day=date(2026, 9, 12),
+            kind="k",
+            payload={},
+            actor_id="x" * 300,
+        )
+    store.close()
+
+
+def test_append_event_rejects_unredacted_dosage_notation_in_subject_and_actor_id(db_path):
+    store = Store.open(db_path)
+    with store.transaction() as txn, pytest.raises(ValueError):
+        txn.append_event(
+            ts_utc=datetime(2026, 9, 12, 9, 0, tzinfo=UTC),
+            local_day=date(2026, 9, 12),
+            kind="k",
+            payload={},
+            subject='parent replied: "take 5 mg now"',
+        )
+    with store.transaction() as txn, pytest.raises(ValueError):
+        txn.append_event(
+            ts_utc=datetime(2026, 9, 12, 9, 0, tzinfo=UTC),
+            local_day=date(2026, 9, 12),
+            kind="k",
+            payload={},
+            actor_id="family:5 mg",
+        )
+    store.close()
+
+
+def test_store_open_rejects_dry_run_directly_and_touches_nothing(db_path):
+    with pytest.raises(RuntimeError):
+        Store.open(db_path, delivery_mode="dry-run")
+    assert not db_path.exists()
+    assert not db_path.parent.exists()
+
+
+def test_mark_delivered_with_unknown_action_key_raises_unknown_action_key_error(db_path):
+    store = Store.open(db_path)
+    with pytest.raises(UnknownActionKeyError):
+        store.mark_delivered(
+            "never-existed", receipt_id="tg-1", delivered_at_utc=datetime(2026, 9, 12, 9, 0, tzinfo=UTC)
+        )
+    store.close()
+
+
+def test_mark_delivered_stale_lease_is_not_unknown_action_key(db_path):
+    store = Store.open(db_path)
+    with store.transaction() as txn:
+        txn.enqueue_outbox(
+            action_key="a",
+            chat_id="1",
+            text="hello",
+            priority=0,
+            available_at_utc=datetime(2026, 9, 12, 9, 0, tzinfo=UTC),
+            created_at_utc=datetime(2026, 9, 12, 9, 0, tzinfo=UTC),
+        )
+    with pytest.raises(LeaseLostError) as excinfo:
+        store.mark_delivered(
+            "a", receipt_id="tg-1", delivered_at_utc=datetime(2026, 9, 12, 9, 0, tzinfo=UTC)
+        )
+    assert not isinstance(excinfo.value, UnknownActionKeyError)
+    store.close()
+
+
+def test_mark_retry_and_mark_failed_distinguish_unknown_action_key(db_path):
+    store = Store.open(db_path)
+    with pytest.raises(UnknownActionKeyError):
+        store.mark_retry(
+            "never-existed",
+            error="x",
+            available_at_utc=datetime(2026, 9, 12, 9, 0, tzinfo=UTC),
+            now_utc=datetime(2026, 9, 12, 9, 0, tzinfo=UTC),
+        )
+    with pytest.raises(UnknownActionKeyError):
+        store.mark_failed(
+            "never-existed", error="x", now_utc=datetime(2026, 9, 12, 9, 0, tzinfo=UTC)
+        )
+    store.close()

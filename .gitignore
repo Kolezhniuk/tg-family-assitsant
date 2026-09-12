@@ -10,3 +10,5 @@ config/meds.yaml
 /yes.pub
 .venv/
 .demo/
+.demo2/
+.demo3/

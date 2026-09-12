@@ -130,8 +130,10 @@ care/
   state.py                        SQLite append-only event log, derived day state
   ladder.py                       check-in state machine
   meds.py                         dose state machine
+  conversation.py                 reply handling, clarify budget, stand-down
+  control.py                      authorisation, pause / skip / stop / schedule
   triage.py                       tripwire matching, verdict contract
-  messages.py                     deterministic message composition
+  messages.py                     deterministic message composition, per-language catalogues
   delivery.py                     hermes send wrapper, dry-run and capture modes
   cli.py                          argparse entry points
 bin/care                          executable shim
@@ -142,6 +144,8 @@ config/
   tripwire.uk.yaml
   affirmatives.en.yaml
   affirmatives.uk.yaml
+  messages.en.yaml
+  messages.uk.yaml
 scripts/
   care-tick.sh                    cron entry point
   install-profile.sh              copies SOUL.md and config fragment into the Hermes profile
@@ -459,6 +463,14 @@ overridable by `CARE_STATE_DB`.
 `hermes send --to telegram:<chat_id>`, reusing the gateway's credentials, so
 there is one place where bot tokens live and the tick works whether or not
 the gateway process is running.
+
+Every deterministic message is a template in `config/messages.<lang>.yaml`,
+not a string in a `.py` file. `roster.yaml` picks the catalogue with
+`message_language` (default `uk`). Keeping the text as data means the family
+can reword what the parent reads without touching code, the wording is
+reviewable by someone who does not program, and `docs/message-catalogue.md`
+can quote it verbatim. Model-composed DMs are unaffected — the catalogue
+covers only what the CLI sends on its own.
 
 Three delivery modes:
 

@@ -127,3 +127,9 @@ def is_affirmative(text: str, catalogue: Catalogue) -> bool:
 
 def is_negated(text: str, catalogue: Catalogue) -> bool:
     return bool(find_matches(text, catalogue))
+
+
+def confirms_dose(text: str, affirmative_catalogue: Catalogue, negative_catalogue: Catalogue) -> bool:
+    if is_negated(text, negative_catalogue):
+        return False
+    return is_affirmative(text, affirmative_catalogue)

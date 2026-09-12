@@ -4,7 +4,16 @@ import pytest
 import yaml
 
 from care.errors import ConfigError
-from care.triage import Catalogue, Term, find_matches, is_affirmative, is_negated, load_catalogue, normalise
+from care.triage import (
+    Catalogue,
+    Term,
+    confirms_dose,
+    find_matches,
+    is_affirmative,
+    is_negated,
+    load_catalogue,
+    normalise,
+)
 
 CONFIG_DIR = Path(__file__).resolve().parent.parent / "config"
 
@@ -173,3 +182,49 @@ def test_is_negated_english_didnt_variants():
     assert is_negated("didn't take it", catalogue)
     assert is_negated("didnt take it", catalogue)
     assert not is_negated("i took it", catalogue)
+
+
+def test_repo_took_dose_stem_has_no_russian_form_and_covers_all_genders():
+    catalogue = load_catalogue(CONFIG_DIR / "affirmatives.uk.yaml")
+    for text in ("я взяв ліки", "я взяла ліки", "вони взяли ліки", "воно взяло"):
+        matches = find_matches(text, catalogue)
+        assert any(m.category == "took_dose" for m in matches), text
+    for match in find_matches("я взяв ліки", catalogue):
+        assert match.term != "взял"
+
+
+def test_repo_fall_tripwire_reaches_all_four_required_forms():
+    catalogue = load_catalogue(CONFIG_DIR / "tripwire.uk.yaml")
+    for text in ("вона впала", "він впав", "вони впали", "вона упала"):
+        matches = find_matches(text, catalogue)
+        assert any(m.category == "fall" for m in matches), text
+
+
+def test_repo_call_ambulance_does_not_fire_on_ordinary_speed_and_quickly_words():
+    catalogue = load_catalogue(CONFIG_DIR / "tripwire.uk.yaml")
+    for text in ("я зроблю це швидко", "яка швидкість інтернету"):
+        matches = find_matches(text, catalogue)
+        assert not any(m.category == "call_ambulance" for m in matches), text
+
+
+def test_repo_call_ambulance_still_fires_on_real_ambulance_requests():
+    catalogue = load_catalogue(CONFIG_DIR / "tripwire.uk.yaml")
+    for text in ("виклич швидку", "потрібна швидка допомога", "швидка вже їде"):
+        matches = find_matches(text, catalogue)
+        assert any(m.category == "call_ambulance" for m in matches), text
+
+
+def test_confirms_dose_requires_affirmative_without_negation():
+    affirmatives = load_catalogue(CONFIG_DIR / "affirmatives.uk.yaml")
+    negatives = load_catalogue(CONFIG_DIR / "negatives.uk.yaml")
+    assert confirms_dose("випила", affirmatives, negatives)
+    assert not confirms_dose("не випила", affirmatives, negatives)
+    assert not confirms_dose("ще не випила", affirmatives, negatives)
+
+
+def test_confirms_dose_english_equivalents():
+    affirmatives = load_catalogue(CONFIG_DIR / "affirmatives.en.yaml")
+    negatives = load_catalogue(CONFIG_DIR / "negatives.en.yaml")
+    assert confirms_dose("i took it", affirmatives, negatives)
+    assert not confirms_dose("didn't take it", affirmatives, negatives)
+    assert not confirms_dose("i haven't taken it", affirmatives, negatives)

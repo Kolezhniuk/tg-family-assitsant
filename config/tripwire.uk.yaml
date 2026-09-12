@@ -4,6 +4,7 @@ entries:
     mode: prefix
     terms:
       - впа
+      - упа
 
   - category: cannot_get_up
     mode: phrase
@@ -22,6 +23,10 @@ entries:
       - не можу дихати
 
   - category: call_ambulance
-    mode: prefix
+    mode: word
     terms:
-      - швидк
+      - швидка
+      - швидку
+      - швидкої
+      - швидкій
+      - швидкою
